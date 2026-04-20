@@ -15,6 +15,9 @@ from typing import Iterable
 AUDIO_EXTENSIONS = {".mp3", ".wma", ".ogg", ".asf", ".wav"}
 PLAYLIST_EXTENSIONS = {".plp", ".plx", ".m3u", ".pls", ".pla"}
 IDX_PAGE_SIZE = 0x400
+IDX_PROTO_MAGIC = b"E10IPX1\x00"
+IDX_OBSERVED_HEADER_BYTES = 0x20
+IDX_OBSERVED_NODE_BYTES = 24
 
 
 @dataclass
@@ -74,6 +77,35 @@ class SourceMediaEntry:
     duration_seconds: float | None
     bit_rate_bps: int | None
     sample_rate_hz: int | None
+
+
+@dataclass
+class TargetLibraryEntry:
+    source_kind: str
+    target_path: str
+    file_name: str
+    title: str | None
+    artist: str | None
+    album: str | None
+    genre: str | None
+    track_number: int | None
+    year: int | None
+    size: int | None
+    duration_seconds: float | None
+    bit_rate_bps: int | None
+    sample_rate_hz: int | None
+    existing_object_id: int | None
+    provisional_object_id: int | None
+
+
+@dataclass
+class TargetDatRecord:
+    record_start: int
+    object_id: int
+    parent_id: int
+    kind: int
+    text: str
+    target_path: str
 
 
 def is_latinish_char(ch: str) -> bool:
@@ -830,6 +862,480 @@ def load_source_entries_from_dirs(
     return entries, manifests
 
 
+def build_rebuild_plan_data(
+    root: Path,
+    media_dirs: list[Path],
+    full_db: bool = False,
+    inventory_paths: list[Path] | None = None,
+    max_collisions: int = 8,
+) -> dict[str, object]:
+    selected_media_dirs = [root / "Music"] if full_db else media_dirs
+    if not selected_media_dirs:
+        raise ValueError("Provide at least one media directory, or use --full-db")
+
+    files = find_db_files(root)
+    db_entries = build_normalized_media_entries(
+        files["db.dat"].read_bytes(),
+        files["db.idx"].read_bytes(),
+        files["db.dic"].read_bytes(),
+    )
+    canonicalized = canonicalize_entries(db_entries)
+    canonical_entries: list[NormalizedMediaEntry] = canonicalized["canonical_entries"]
+    source_entries, manifests = load_source_entries_from_dirs(root, selected_media_dirs, inventory_paths=inventory_paths)
+
+    canonical_by_name: dict[str, list[NormalizedMediaEntry]] = {}
+    canonical_by_path: dict[str, list[NormalizedMediaEntry]] = {}
+    for entry in canonical_entries:
+        canonical_by_name.setdefault(entry.file_name, []).append(entry)
+        canonical_by_path.setdefault(entry.inferred_path, []).append(entry)
+
+    planned_additions = []
+    exact_path_collisions = []
+    name_collisions = []
+    for entry in source_entries:
+        absolute_path = Path(entry.path).resolve()
+        try:
+            target_path = absolute_path.relative_to(root).as_posix()
+        except ValueError:
+            target_path = entry.relative_path
+        same_path = canonical_by_path.get(target_path, [])
+        same_name = canonical_by_name.get(entry.file_name, [])
+        if same_path:
+            exact_path_collisions.append(
+                {
+                    "target_path": target_path,
+                    "source": asdict(entry),
+                    "existing": [asdict(existing) for existing in same_path[:max_collisions]],
+                }
+            )
+            continue
+        if same_name:
+            name_collisions.append(
+                {
+                    "target_path": target_path,
+                    "source": asdict(entry),
+                    "existing": [asdict(existing) for existing in same_name[:max_collisions]],
+                }
+            )
+        planned_additions.append(
+            {
+                "target_path": target_path,
+                "source": asdict(entry),
+            }
+        )
+
+    return {
+        "canonical_entries": canonical_entries,
+        "source_entries": source_entries,
+        "selected_sources": manifests,
+        "mode": "full-db" if full_db else "selected-dirs",
+        "planned_additions": planned_additions,
+        "exact_path_collisions": exact_path_collisions,
+        "name_collisions": name_collisions,
+    }
+
+
+def build_target_library_entries(
+    canonical_entries: list[NormalizedMediaEntry],
+    planned_additions: list[dict[str, object]],
+) -> list[TargetLibraryEntry]:
+    entries: list[TargetLibraryEntry] = []
+    max_object_id = max((entry.object_id for entry in canonical_entries), default=0)
+    next_object_id = max_object_id + 1
+
+    for entry in canonical_entries:
+        entries.append(
+            TargetLibraryEntry(
+                source_kind="existing",
+                target_path=entry.inferred_path,
+                file_name=entry.file_name,
+                title=None,
+                artist=None,
+                album=None,
+                genre=None,
+                track_number=None,
+                year=None,
+                size=None,
+                duration_seconds=None,
+                bit_rate_bps=None,
+                sample_rate_hz=None,
+                existing_object_id=entry.object_id,
+                provisional_object_id=None,
+            )
+        )
+
+    for item in planned_additions:
+        source = item["source"]
+        entries.append(
+            TargetLibraryEntry(
+                source_kind="planned_addition",
+                target_path=item["target_path"],
+                file_name=source["file_name"],
+                title=source.get("title"),
+                artist=source.get("artist"),
+                album=source.get("album"),
+                genre=source.get("genre"),
+                track_number=source.get("track_number"),
+                year=source.get("year"),
+                size=source.get("size"),
+                duration_seconds=source.get("duration_seconds"),
+                bit_rate_bps=source.get("bit_rate_bps"),
+                sample_rate_hz=source.get("sample_rate_hz"),
+                existing_object_id=None,
+                provisional_object_id=next_object_id,
+            )
+        )
+        next_object_id += 1
+
+    entries.sort(key=lambda entry: (entry.target_path.lower(), entry.source_kind, entry.provisional_object_id or -1))
+    return entries
+
+
+def build_existing_folder_entries(db_dat: bytes) -> dict[str, DatRecord]:
+    records = validated_folder_file_records(db_dat)
+    records_by_id = {record.object_id: record for record in records}
+    folder_map: dict[str, DatRecord] = {}
+    for record in records:
+        if record.kind != 0x100:
+            continue
+        _ancestor_ids, _ancestor_names, inferred_path = infer_record_path(record, records_by_id)
+        existing = folder_map.get(inferred_path)
+        if existing is None or record.record_start < existing.record_start:
+            folder_map[inferred_path] = record
+    return folder_map
+
+
+def target_entry_object_id(entry: TargetLibraryEntry) -> int:
+    if entry.existing_object_id is not None:
+        return entry.existing_object_id
+    if entry.provisional_object_id is not None:
+        return entry.provisional_object_id
+    raise ValueError(f"Target entry has no object id: {entry.target_path}")
+
+
+def serialize_dat_record_bytes(object_id: int, parent_id: int, kind: int, text: str) -> bytes:
+    return struct.pack(">III", object_id, parent_id & 0xFFFFFFFF, kind) + text.encode("utf-16le") + b"\x00\x00"
+
+
+def build_dbdat_prototype_records(
+    root: Path,
+    target_library: list[TargetLibraryEntry],
+) -> list[TargetDatRecord]:
+    db_dat = find_db_files(root)["db.dat"].read_bytes()
+    existing_folder_map = build_existing_folder_entries(db_dat)
+    max_existing_folder_id = max((record.object_id for record in existing_folder_map.values()), default=0)
+    max_existing_target_id = max((target_entry_object_id(entry) for entry in target_library), default=0)
+    next_object_id = max(max_existing_folder_id, max_existing_target_id) + 1
+
+    folder_path_set: set[str] = set()
+    for entry in target_library:
+        parent = str(Path(entry.target_path).parent).replace("\\", "/")
+        if parent in {"", "."}:
+            continue
+        parts = Path(parent).parts
+        for index in range(1, len(parts) + 1):
+            folder_path_set.add("/".join(parts[:index]))
+
+    folder_paths = sorted(folder_path_set, key=lambda path: (path.count("/"), path.lower()))
+
+    folder_ids: dict[str, int] = {}
+    for folder_path in folder_paths:
+        if folder_path in existing_folder_map:
+            folder_ids[folder_path] = existing_folder_map[folder_path].object_id
+        else:
+            folder_ids[folder_path] = next_object_id
+            next_object_id += 1
+
+    folders_by_parent: dict[str, list[str]] = {}
+    files_by_parent: dict[str, list[TargetLibraryEntry]] = {}
+    for folder_path in folder_paths:
+        parent = str(Path(folder_path).parent).replace("\\", "/")
+        if parent == ".":
+            parent = ""
+        folders_by_parent.setdefault(parent, []).append(folder_path)
+    for entry in target_library:
+        parent = str(Path(entry.target_path).parent).replace("\\", "/")
+        if parent == ".":
+            parent = ""
+        files_by_parent.setdefault(parent, []).append(entry)
+
+    for paths in folders_by_parent.values():
+        paths.sort(key=lambda path: (0 if path == "Music" else 1, path.lower()))
+    for entries in files_by_parent.values():
+        entries.sort(key=lambda entry: entry.target_path.lower())
+
+    records: list[TargetDatRecord] = []
+    offset = 0
+
+    def append_record(object_id: int, parent_id: int, kind: int, text: str, target_path: str) -> None:
+        nonlocal offset
+        records.append(
+            TargetDatRecord(
+                record_start=offset,
+                object_id=object_id,
+                parent_id=parent_id,
+                kind=kind,
+                text=text,
+                target_path=target_path,
+            )
+        )
+        offset += len(serialize_dat_record_bytes(object_id, parent_id, kind, text))
+
+    def emit_folder(folder_path: str) -> None:
+        folder_name = Path(folder_path).name + "/"
+        parent_path = str(Path(folder_path).parent).replace("\\", "/")
+        if parent_path == ".":
+            parent_path = ""
+        parent_id = 0xFFFFFFFF if folder_path == "Music" else folder_ids.get(parent_path, 0)
+        append_record(folder_ids[folder_path], parent_id, 0x100, folder_name, folder_path)
+        for entry in files_by_parent.get(folder_path, []):
+            append_record(target_entry_object_id(entry), folder_ids[folder_path], 0x200, entry.file_name, entry.target_path)
+        for child_folder in folders_by_parent.get(folder_path, []):
+            emit_folder(child_folder)
+
+    for entry in files_by_parent.get("", []):
+        append_record(target_entry_object_id(entry), 0, 0x200, entry.file_name, entry.target_path)
+    for folder_path in folders_by_parent.get("", []):
+        emit_folder(folder_path)
+
+    return records
+
+
+def serialize_dbdat_prototype(records: list[TargetDatRecord]) -> bytes:
+    return b"".join(
+        serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text)
+        for record in records
+    )
+
+
+def target_title_for_idx(entry: TargetLibraryEntry) -> str:
+    return entry.title or Path(entry.file_name).stem
+
+
+def pack_utf16be_null_terminated(text: str) -> bytes:
+    return text.encode("utf-16be") + b"\x00\x00"
+
+
+def build_idx_prototype_pages(
+    root: Path,
+    target_library: list[TargetLibraryEntry],
+    dbdat_records: list[TargetDatRecord],
+    db_dic: bytes,
+) -> tuple[list[bytes], list[dict[str, object]]]:
+    field_offsets = {
+        field.name: field.entry_offset
+        for field in parse_db_dic(db_dic)
+    }
+    dbdat_by_target_path = {
+        record.target_path: record
+        for record in dbdat_records
+        if record.kind == 0x200
+    }
+
+    pages: list[bytes] = []
+    page_summaries: list[dict[str, object]] = []
+    current_items: list[dict[str, object]] = []
+    current_nodes: list[dict[str, object]] = []
+    current_offset = IDX_OBSERVED_HEADER_BYTES
+
+    text_node_specs = [
+        ("FilePath", lambda entry: entry.target_path, 0x11),
+        ("FileName", lambda entry: entry.file_name, 0x02),
+        ("Title", lambda entry: target_title_for_idx(entry), 0x07),
+        ("Artist", lambda entry: entry.artist or "", 0x08),
+        ("Album", lambda entry: entry.album or "", 0x04),
+        ("Genre", lambda entry: entry.genre or "", 0x05),
+    ]
+    numeric_node_specs = [
+        ("Duration", lambda entry: int((entry.duration_seconds or 0) * 1000), 0x21),
+        ("BitRate", lambda entry: entry.bit_rate_bps or 0, 0x22),
+        ("SampleRate", lambda entry: entry.sample_rate_hz or 0, 0x23),
+    ]
+
+    def finalize_page(page_index: int) -> None:
+        nonlocal current_offset
+        if not current_nodes:
+            return
+        page = bytearray(IDX_PAGE_SIZE)
+        page_base = page_index * IDX_PAGE_SIZE
+        first_node_abs_offset = page_base + current_nodes[0]["start_rel"]
+        last_node_abs_offset = page_base + current_nodes[-1]["start_rel"]
+        struct.pack_into(">I", page, 0, first_node_abs_offset)
+        struct.pack_into(">I", page, 4, last_node_abs_offset)
+        struct.pack_into(">I", page, 8, len(current_nodes))
+        struct.pack_into(">I", page, 12, len(current_items))
+        struct.pack_into(">I", page, 16, current_items[0]["dat_record_start"])
+        struct.pack_into(">I", page, 20, current_items[-1]["dat_record_start"])
+        struct.pack_into(">I", page, 24, current_items[0]["object_id"])
+        struct.pack_into(">I", page, 28, current_offset)
+
+        for index, node in enumerate(current_nodes):
+            base = node["start_rel"]
+            next_rel = current_nodes[index + 1]["start_rel"] if index + 1 < len(current_nodes) else 0
+            next_abs = page_base + next_rel if next_rel else 0
+            struct.pack_into(">I", page, base + 0, node["dat_record_start"])
+            struct.pack_into(">I", page, base + 4, node["object_id"])
+            struct.pack_into(">I", page, base + 8, node["field_entry_offset"])
+            struct.pack_into(">I", page, base + 12, node["value"])
+            struct.pack_into(">I", page, base + 16, node["node_type"])
+            struct.pack_into(">I", page, base + 20, next_abs)
+            payload = node["payload"]
+            page[base + IDX_OBSERVED_NODE_BYTES:base + IDX_OBSERVED_NODE_BYTES + len(payload)] = payload
+
+        pages.append(bytes(page))
+        page_summaries.append(
+            {
+                "page_index": page_index,
+                "item_count": len(current_items),
+                "node_count": len(current_nodes),
+                "first_node_abs_offset": first_node_abs_offset,
+                "last_node_abs_offset": last_node_abs_offset,
+                "bytes_used": current_offset,
+                "items": [
+                    {
+                        "target_path": item["target_path"],
+                        "object_id": item["object_id"],
+                        "dat_record_start": item["dat_record_start"],
+                        "flags": item["flags"],
+                        "node_count": item["node_count"],
+                    }
+                    for item in current_items
+                ],
+            }
+        )
+        current_items.clear()
+        current_nodes.clear()
+        current_offset = IDX_OBSERVED_HEADER_BYTES
+
+    sorted_entries = sorted(target_library, key=lambda entry: entry.target_path.lower())
+    for entry in sorted_entries:
+        dbdat_record = dbdat_by_target_path.get(entry.target_path)
+        if dbdat_record is None:
+            continue
+        entry_nodes: list[dict[str, object]] = []
+        for field_name, getter, node_type in text_node_specs:
+            text = getter(entry)
+            if not text:
+                continue
+            entry_nodes.append(
+                {
+                    "field_name": field_name,
+                    "field_entry_offset": field_offsets.get(field_name, 0),
+                    "value": 0,
+                    "node_type": node_type,
+                    "payload": pack_utf16be_null_terminated(text),
+                    "payload_text": text,
+                }
+            )
+        for field_name, getter, node_type in numeric_node_specs:
+            value = getter(entry)
+            if not value:
+                continue
+            entry_nodes.append(
+                {
+                    "field_name": field_name,
+                    "field_entry_offset": field_offsets.get(field_name, 0),
+                    "value": value,
+                    "node_type": node_type,
+                    "payload": b"",
+                    "payload_text": "",
+                }
+            )
+
+        entry_size = sum(IDX_OBSERVED_NODE_BYTES + len(node["payload"]) for node in entry_nodes)
+        if current_items and current_offset + entry_size > IDX_PAGE_SIZE:
+            finalize_page(len(pages))
+        if IDX_OBSERVED_HEADER_BYTES + entry_size > IDX_PAGE_SIZE:
+            raise ValueError(f"One observed idx prototype item exceeds page size: {entry.target_path}")
+
+        item_node_count = 0
+        for node in entry_nodes:
+            node["dat_record_start"] = dbdat_record.record_start
+            node["object_id"] = dbdat_record.object_id
+            node["start_rel"] = current_offset
+            current_nodes.append(node)
+            current_offset += IDX_OBSERVED_NODE_BYTES + len(node["payload"])
+            item_node_count += 1
+
+        current_items.append(
+            {
+                "target_path": entry.target_path,
+                "object_id": dbdat_record.object_id,
+                "dat_record_start": dbdat_record.record_start,
+                "flags": 1 if entry.source_kind == "existing" else 2,
+                "node_count": item_node_count,
+            }
+        )
+
+    if current_nodes:
+        finalize_page(len(pages))
+
+    return pages, page_summaries
+
+
+def parse_idx_prototype_pages(data: bytes) -> list[dict[str, object]]:
+    if len(data) % IDX_PAGE_SIZE != 0:
+        raise ValueError("idx prototype length must be page-aligned")
+    pages = []
+    for page_index in range(len(data) // IDX_PAGE_SIZE):
+        block = data[page_index * IDX_PAGE_SIZE:(page_index + 1) * IDX_PAGE_SIZE]
+        page_base = page_index * IDX_PAGE_SIZE
+        first_node_abs = struct.unpack_from(">I", block, 0)[0]
+        last_node_abs = struct.unpack_from(">I", block, 4)[0]
+        node_count_header = struct.unpack_from(">I", block, 8)[0]
+        item_count_header = struct.unpack_from(">I", block, 12)[0]
+        bytes_used = struct.unpack_from(">I", block, 28)[0]
+        nodes = []
+        next_abs = first_node_abs
+        seen: set[int] = set()
+        while page_base <= next_abs < page_base + IDX_PAGE_SIZE:
+            rel = next_abs - page_base
+            if rel in seen or rel + IDX_OBSERVED_NODE_BYTES > IDX_PAGE_SIZE:
+                break
+            seen.add(rel)
+            dat_record_start, object_id, field_entry_offset, value, node_type, node_next_abs = struct.unpack_from(">IIIIII", block, rel)
+            if page_base <= node_next_abs < page_base + IDX_PAGE_SIZE:
+                payload_end = node_next_abs - page_base
+            else:
+                payload_end = bytes_used if bytes_used and bytes_used <= IDX_PAGE_SIZE else IDX_PAGE_SIZE
+            payload = block[rel + IDX_OBSERVED_NODE_BYTES:payload_end] if payload_end > rel + IDX_OBSERVED_NODE_BYTES else b""
+            payload_text = ""
+            if payload and len(payload) % 2 == 0:
+                try:
+                    payload_text = payload.decode("utf-16be").split("\x00", 1)[0]
+                except UnicodeDecodeError:
+                    payload_text = ""
+            nodes.append(
+                {
+                    "start_rel": rel,
+                    "dat_record_start": dat_record_start,
+                    "object_id": object_id,
+                    "field_entry_offset": field_entry_offset,
+                    "value": value,
+                    "node_type": node_type,
+                    "next_abs_offset": node_next_abs,
+                    "payload_text": payload_text,
+                }
+            )
+            if node_next_abs == 0:
+                break
+            next_abs = node_next_abs
+        item_count = sum(1 for node in nodes if node["node_type"] == 0x11)
+        pages.append(
+            {
+                "page_index": page_index,
+                "item_count": item_count,
+                "item_count_header": item_count_header,
+                "node_count": len(nodes),
+                "node_count_header": node_count_header,
+                "first_node_abs_offset": first_node_abs,
+                "last_node_abs_offset": last_node_abs,
+                "bytes_used": bytes_used,
+            }
+        )
+    return pages
+
+
 def command_db_summary(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     files = find_db_files(root)
@@ -1331,61 +1837,20 @@ def command_model_export(args: argparse.Namespace) -> int:
 def command_rebuild_plan(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     media_dirs = [Path(path).resolve() for path in args.media_dirs]
-    if args.full_db:
-        media_dirs = [root / "Music"]
-    if not media_dirs:
-        raise ValueError("Provide at least one media directory, or use --full-db")
     inventory_paths = [Path(path).resolve() for path in args.inventory] if args.inventory else None
-
-    files = find_db_files(root)
-    db_entries = build_normalized_media_entries(
-        files["db.dat"].read_bytes(),
-        files["db.idx"].read_bytes(),
-        files["db.dic"].read_bytes(),
+    plan = build_rebuild_plan_data(
+        root,
+        media_dirs,
+        full_db=args.full_db,
+        inventory_paths=inventory_paths,
+        max_collisions=args.max_collisions,
     )
-    canonicalized = canonicalize_entries(db_entries)
-    canonical_entries: list[NormalizedMediaEntry] = canonicalized["canonical_entries"]
-    source_entries, manifests = load_source_entries_from_dirs(root, media_dirs, inventory_paths=inventory_paths)
-
-    canonical_by_name: dict[str, list[NormalizedMediaEntry]] = {}
-    canonical_by_path: dict[str, list[NormalizedMediaEntry]] = {}
-    for entry in canonical_entries:
-        canonical_by_name.setdefault(entry.file_name, []).append(entry)
-        canonical_by_path.setdefault(entry.inferred_path, []).append(entry)
-
-    planned_additions = []
-    exact_path_collisions = []
-    name_collisions = []
-    for entry in source_entries:
-        try:
-            absolute_path = Path(entry.path).resolve()
-            target_path = absolute_path.relative_to(root).as_posix()
-        except ValueError:
-            target_path = entry.relative_path
-        same_path = canonical_by_path.get(target_path, [])
-        same_name = canonical_by_name.get(entry.file_name, [])
-        if same_path:
-            exact_path_collisions.append(
-                {
-                    "source": asdict(entry),
-                    "existing": [asdict(existing) for existing in same_path[: args.max_collisions]],
-                }
-            )
-            continue
-        if same_name:
-            name_collisions.append(
-                {
-                    "source": asdict(entry),
-                    "target_path": target_path,
-                    "existing": [asdict(existing) for existing in same_name[: args.max_collisions]],
-                }
-            )
-        planned_additions.append(
-            {
-                "target_path": target_path,
-                "source": asdict(entry),
-            }
-        )
+    canonical_entries: list[NormalizedMediaEntry] = plan["canonical_entries"]
+    source_entries: list[SourceMediaEntry] = plan["source_entries"]
+    manifests = plan["selected_sources"]
+    planned_additions = plan["planned_additions"]
+    exact_path_collisions = plan["exact_path_collisions"]
+    name_collisions = plan["name_collisions"]
 
     report = {
         "root": str(root),
@@ -1399,6 +1864,231 @@ def command_rebuild_plan(args: argparse.Namespace) -> int:
         "planned_additions": planned_additions[: args.limit],
         "exact_path_collisions": exact_path_collisions[: args.max_groups],
         "name_collisions": name_collisions[: args.max_groups],
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def command_write_rebuild_snapshot(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    media_dirs = [Path(path).resolve() for path in args.media_dirs]
+    inventory_paths = [Path(path).resolve() for path in args.inventory] if args.inventory else None
+    out_dir = Path(args.out_dir).resolve()
+
+    plan = build_rebuild_plan_data(
+        root,
+        media_dirs,
+        full_db=args.full_db,
+        inventory_paths=inventory_paths,
+        max_collisions=args.max_collisions,
+    )
+    canonical_entries: list[NormalizedMediaEntry] = plan["canonical_entries"]
+    target_library = build_target_library_entries(canonical_entries, plan["planned_additions"])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "root": str(root),
+        "mode": plan["mode"],
+        "selected_sources": plan["selected_sources"],
+        "canonical_database_entry_count": len(canonical_entries),
+        "planned_addition_count": len(plan["planned_additions"]),
+        "exact_path_collision_count": len(plan["exact_path_collisions"]),
+        "name_collision_count": len(plan["name_collisions"]),
+        "target_library_entry_count": len(target_library),
+    }
+
+    write_snapshot_artifacts(out_dir, manifest, canonical_entries, plan, target_library)
+
+    report = {
+        "out_dir": str(out_dir),
+        **manifest,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def write_snapshot_artifacts(
+    out_dir: Path,
+    manifest: dict[str, object],
+    canonical_entries: list[NormalizedMediaEntry],
+    plan: dict[str, object],
+    target_library: list[TargetLibraryEntry],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (out_dir / "canonical_entries.json").write_text(
+        json.dumps([asdict(entry) for entry in canonical_entries], indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "planned_additions.json").write_text(
+        json.dumps(plan["planned_additions"], indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "target_library.json").write_text(
+        json.dumps([asdict(entry) for entry in target_library], indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "collisions.json").write_text(
+        json.dumps(
+            {
+                "exact_path_collisions": plan["exact_path_collisions"],
+                "name_collisions": plan["name_collisions"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+
+def command_write_dbdat_prototype(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    media_dirs = [Path(path).resolve() for path in args.media_dirs]
+    inventory_paths = [Path(path).resolve() for path in args.inventory] if args.inventory else None
+    out_dir = Path(args.out_dir).resolve()
+
+    plan = build_rebuild_plan_data(
+        root,
+        media_dirs,
+        full_db=args.full_db,
+        inventory_paths=inventory_paths,
+        max_collisions=args.max_collisions,
+    )
+    target_library = build_target_library_entries(plan["canonical_entries"], plan["planned_additions"])
+    records = build_dbdat_prototype_records(root, target_library)
+    dbdat_bytes = serialize_dbdat_prototype(records)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dbdat_path = out_dir / "db.dat.prototype"
+    records_path = out_dir / "db.dat.records.json"
+    dbdat_path.write_bytes(dbdat_bytes)
+    records_path.write_text(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    reparsed = validated_folder_file_records(dbdat_bytes)
+    report = {
+        "out_dir": str(out_dir),
+        "dbdat_path": str(dbdat_path),
+        "records_path": str(records_path),
+        "record_count": len(records),
+        "serialized_size_bytes": len(dbdat_bytes),
+        "reparsed_record_count": len(reparsed),
+        "planned_addition_count": len(plan["planned_additions"]),
+        "target_library_entry_count": len(target_library),
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def command_write_idx_prototype(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    media_dirs = [Path(path).resolve() for path in args.media_dirs]
+    inventory_paths = [Path(path).resolve() for path in args.inventory] if args.inventory else None
+    out_dir = Path(args.out_dir).resolve()
+
+    files = find_db_files(root)
+    db_dic = files["db.dic"].read_bytes()
+    plan = build_rebuild_plan_data(
+        root,
+        media_dirs,
+        full_db=args.full_db,
+        inventory_paths=inventory_paths,
+        max_collisions=args.max_collisions,
+    )
+    target_library = build_target_library_entries(plan["canonical_entries"], plan["planned_additions"])
+    dbdat_records = build_dbdat_prototype_records(root, target_library)
+    pages, page_summaries = build_idx_prototype_pages(root, target_library, dbdat_records, db_dic)
+    idx_bytes = b"".join(pages)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    idx_path = out_dir / "db.idx.prototype"
+    pages_path = out_dir / "db.idx.pages.json"
+    idx_path.write_bytes(idx_bytes)
+    pages_path.write_text(json.dumps(page_summaries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    reparsed_pages = parse_idx_prototype_pages(idx_bytes)
+    report = {
+        "out_dir": str(out_dir),
+        "idx_path": str(idx_path),
+        "pages_path": str(pages_path),
+        "page_count": len(pages),
+        "serialized_size_bytes": len(idx_bytes),
+        "reparsed_page_count": len(reparsed_pages),
+        "target_library_entry_count": len(target_library),
+        "planned_addition_count": len(plan["planned_additions"]),
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def command_write_rebuild_prototype(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    media_dirs = [Path(path).resolve() for path in args.media_dirs]
+    inventory_paths = [Path(path).resolve() for path in args.inventory] if args.inventory else None
+    out_dir = Path(args.out_dir).resolve()
+
+    files = find_db_files(root)
+    db_dic = files["db.dic"].read_bytes()
+    plan = build_rebuild_plan_data(
+        root,
+        media_dirs,
+        full_db=args.full_db,
+        inventory_paths=inventory_paths,
+        max_collisions=args.max_collisions,
+    )
+    canonical_entries: list[NormalizedMediaEntry] = plan["canonical_entries"]
+    target_library = build_target_library_entries(canonical_entries, plan["planned_additions"])
+    records = build_dbdat_prototype_records(root, target_library)
+    dbdat_bytes = serialize_dbdat_prototype(records)
+    pages, page_summaries = build_idx_prototype_pages(root, target_library, records, db_dic)
+    idx_bytes = b"".join(pages)
+
+    manifest = {
+        "root": str(root),
+        "mode": plan["mode"],
+        "selected_sources": plan["selected_sources"],
+        "canonical_database_entry_count": len(canonical_entries),
+        "planned_addition_count": len(plan["planned_additions"]),
+        "exact_path_collision_count": len(plan["exact_path_collisions"]),
+        "name_collision_count": len(plan["name_collisions"]),
+        "target_library_entry_count": len(target_library),
+        "dbdat_record_count": len(records),
+        "dbdat_serialized_size_bytes": len(dbdat_bytes),
+        "idx_page_count": len(pages),
+        "idx_serialized_size_bytes": len(idx_bytes),
+    }
+    write_snapshot_artifacts(out_dir, manifest, canonical_entries, plan, target_library)
+
+    dbdat_path = out_dir / "db.dat.prototype"
+    records_path = out_dir / "db.dat.records.json"
+    idx_path = out_dir / "db.idx.prototype"
+    pages_path = out_dir / "db.idx.pages.json"
+    dic_reference_path = out_dir / "db.dic.reference"
+    dbdat_path.write_bytes(dbdat_bytes)
+    records_path.write_text(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    idx_path.write_bytes(idx_bytes)
+    pages_path.write_text(json.dumps(page_summaries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    dic_reference_path.write_bytes(db_dic)
+
+    reparsed_records = validated_folder_file_records(dbdat_bytes)
+    reparsed_pages = parse_idx_prototype_pages(idx_bytes)
+    report = {
+        "out_dir": str(out_dir),
+        "manifest_path": str(out_dir / "manifest.json"),
+        "dbdat_path": str(dbdat_path),
+        "records_path": str(records_path),
+        "idx_path": str(idx_path),
+        "pages_path": str(pages_path),
+        "dic_reference_path": str(dic_reference_path),
+        "record_count": len(records),
+        "reparsed_record_count": len(reparsed_records),
+        "page_count": len(pages),
+        "reparsed_page_count": len(reparsed_pages),
+        "planned_addition_count": len(plan["planned_additions"]),
+        "target_library_entry_count": len(target_library),
     }
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -1499,6 +2189,42 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_plan.add_argument("--max-groups", type=int, default=20, help="Maximum collision groups to include")
     rebuild_plan.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
     rebuild_plan.set_defaults(func=command_rebuild_plan)
+
+    write_rebuild_snapshot = subparsers.add_parser("write-rebuild-snapshot", help="Write a safe rebuild snapshot to an output directory for later db.dat/db.idx generation.")
+    write_rebuild_snapshot.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    write_rebuild_snapshot.add_argument("out_dir", help="Output directory for the rebuild snapshot")
+    write_rebuild_snapshot.add_argument("media_dirs", nargs="*", help="Directories containing source media files to include")
+    write_rebuild_snapshot.add_argument("--full-db", action="store_true", help="Snapshot the full ROOT/Music tree instead of explicit directories")
+    write_rebuild_snapshot.add_argument("--inventory", action="append", help="Optional inventory JSON files, in the same order as media_dirs")
+    write_rebuild_snapshot.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
+    write_rebuild_snapshot.set_defaults(func=command_write_rebuild_snapshot)
+
+    write_dbdat_prototype = subparsers.add_parser("write-dbdat-prototype", help="Write a first db.dat prototype from the target library model.")
+    write_dbdat_prototype.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    write_dbdat_prototype.add_argument("out_dir", help="Output directory for the db.dat prototype")
+    write_dbdat_prototype.add_argument("media_dirs", nargs="*", help="Directories containing source media files to include")
+    write_dbdat_prototype.add_argument("--full-db", action="store_true", help="Prototype against the full ROOT/Music tree instead of explicit directories")
+    write_dbdat_prototype.add_argument("--inventory", action="append", help="Optional inventory JSON files, in the same order as media_dirs")
+    write_dbdat_prototype.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
+    write_dbdat_prototype.set_defaults(func=command_write_dbdat_prototype)
+
+    write_idx_prototype = subparsers.add_parser("write-idx-prototype", help="Write a first db.idx prototype from the target library model.")
+    write_idx_prototype.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    write_idx_prototype.add_argument("out_dir", help="Output directory for the db.idx prototype")
+    write_idx_prototype.add_argument("media_dirs", nargs="*", help="Directories containing source media files to include")
+    write_idx_prototype.add_argument("--full-db", action="store_true", help="Prototype against the full ROOT/Music tree instead of explicit directories")
+    write_idx_prototype.add_argument("--inventory", action="append", help="Optional inventory JSON files, in the same order as media_dirs")
+    write_idx_prototype.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
+    write_idx_prototype.set_defaults(func=command_write_idx_prototype)
+
+    write_rebuild_prototype = subparsers.add_parser("write-rebuild-prototype", help="Write a complete rebuild-prototype bundle with snapshot JSON, db.dat prototype, db.idx prototype, and a db.dic reference copy.")
+    write_rebuild_prototype.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    write_rebuild_prototype.add_argument("out_dir", help="Output directory for the rebuild prototype bundle")
+    write_rebuild_prototype.add_argument("media_dirs", nargs="*", help="Directories containing source media files to include")
+    write_rebuild_prototype.add_argument("--full-db", action="store_true", help="Prototype against the full ROOT/Music tree instead of explicit directories")
+    write_rebuild_prototype.add_argument("--inventory", action="append", help="Optional inventory JSON files, in the same order as media_dirs")
+    write_rebuild_prototype.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
+    write_rebuild_prototype.set_defaults(func=command_write_rebuild_prototype)
 
     return parser
 

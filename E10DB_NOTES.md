@@ -40,6 +40,10 @@ python3 e10db_tool.py model-export /run/media/nichlas/E10
 python3 e10db_tool.py source-model /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py rebuild-plan /run/media/nichlas/E10 /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py rebuild-plan /run/media/nichlas/E10 --full-db
+python3 e10db_tool.py write-rebuild-snapshot /run/media/nichlas/E10 /tmp/e10_snapshot_podcast /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
+python3 e10db_tool.py write-dbdat-prototype /run/media/nichlas/E10 /tmp/e10_dbdat_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
+python3 e10db_tool.py write-idx-prototype /run/media/nichlas/E10 /tmp/e10_idx_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
+python3 e10db_tool.py write-rebuild-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 ```
 
 What the current tooling gives us:
@@ -52,6 +56,10 @@ What the current tooling gives us:
 - `model-export` builds a normalized per-file model from validated folder/file records, inferred ancestry, index coverage, and a simple canonicalization pass over duplicates.
 - `source-model` builds the same kind of normalized source view from one or more selected filesystem directories.
 - `rebuild-plan` compares selected source directories, or the full `Music/` tree, against the canonical E10 database model.
+- `write-rebuild-snapshot` writes a safe on-disk rebuild snapshot with canonical entries, planned additions, collisions, and a merged target library for later binary serialization.
+- `write-dbdat-prototype` takes the merged target library and emits a first `db.dat` prototype for the validated folder/file object graph.
+- `write-idx-prototype` takes the same target library plus the current `db.dic` schema and emits a first page-aligned observed-chain `db.idx` prototype.
+- `write-rebuild-prototype` packages the full current rebuild work product in one directory: snapshot JSON, `db.dat` prototype, `db.idx` prototype, and a `db.dic` reference copy.
 - `missing-media` confirms that the 32 podcast episodes in this directory are on disk but absent from the E10 database.
 
 What `media-cluster` has shown so far:
@@ -71,6 +79,29 @@ What `rebuild-plan` has shown so far:
 - The selected-folder workflow is therefore good enough to drive a future “regenerate just this subtree” mode.
 - The full-db mode exists in the CLI now as `--full-db`, but on a large library it should be paired with cached inventory JSON if you want faster repeat runs.
 
+What `write-rebuild-snapshot` has shown so far:
+- The first write phase is now real, but still safe: it writes JSON artifacts rather than touching `System/db.dat` or `System/db.idx`.
+- For `Music/Podcast`, the snapshot currently produces 554 canonical existing entries, 32 planned additions, and a merged target library of 586 entries.
+- This is now the handoff boundary for the next implementation step: a serializer that converts the snapshot into new E10 database binaries.
+
+What `write-dbdat-prototype` has shown so far:
+- The first binary writer now exists for the validated `db.dat` subset: folder and file object records.
+- For `Music/Podcast`, the current prototype emits 815 records and reparses cleanly back to 815 validated folder/file records.
+- The generated prototype contains the expected `Music/` root, a new `Podcast/` folder under it, and the planned podcast files with provisional object IDs.
+- This is still only one part of the final rebuild. The full E10 database also depends on `db.idx` and likely additional object semantics beyond the validated folder/file subset.
+
+What `write-idx-prototype` has shown so far:
+- The first native `db.idx` prototype writer now exists and covers the full current target library instead of just top-level items.
+- The serializer no longer uses the earlier custom magic-header page format. It now emits observed chain-style pages with a 32-byte page summary, then 24-byte big-endian nodes linked by absolute next offsets, followed by inline UTF-16BE payloads.
+- For `Music/Podcast`, the current observed-chain prototype emits 206 pages, reparses cleanly back to 206 pages, and still covers all 586 target-library entries.
+- The page summaries now carry deterministic `target_path`, `object_id`, `db.dat` record-start links, and node counts for both existing tracks and planned additions.
+- This is still not the final firmware-compatible layout, but it is materially closer to the original E10 pages than the earlier fixed-header prototype.
+
+What `write-rebuild-prototype` gives us:
+- The current serializer path can now be run as one command for either one selected subtree or the full `Music/` library.
+- The output bundle is self-contained for debugging and iteration: snapshot JSON, `db.dat.prototype`, `db.idx.prototype`, and the reference `db.dic`.
+- This is the current handoff boundary for turning the prototype formats into real E10-compatible database files.
+
 Current working hypothesis:
 - The player database is closer to an object store than a flat list.
 - The minimum viable modern workflow is:
@@ -86,4 +117,4 @@ Current known constraints:
 - The current `db.idx` string scan is good enough for targeted reverse-engineering, but still too noisy to be treated as a canonical file list.
 - The final patcher will probably need either compaction/rebuild or record reuse, not a naive append-only write.
 
-The next engineering step is a generator that targets the canonical media model, not more GUI automation and not one-off page patching.
+The next engineering step is to infer the actual meaning of the observed node words and replace the remaining placeholder semantics while keeping the same high-level rebuild pipeline.
