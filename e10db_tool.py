@@ -526,6 +526,114 @@ def summarize_idx_page(
     }
 
 
+def decode_observed_idx_payload_text(payload: bytes) -> str | None:
+    if not payload or len(payload) % 2 != 0:
+        return None
+    try:
+        text = payload.decode("utf-16be").split("\x00", 1)[0]
+    except UnicodeDecodeError:
+        return None
+    if not text or not all(is_reasonable_text_char(ch) for ch in text):
+        return None
+    return text
+
+
+def parse_observed_idx_page(
+    db_idx: bytes,
+    page_index: int,
+    annotation_maps: dict[str, dict[int, str]],
+    max_nodes: int = 64,
+    max_groups: int = 24,
+) -> dict[str, object]:
+    page_offset = page_index * IDX_PAGE_SIZE
+    block = db_idx[page_offset:page_offset + IDX_PAGE_SIZE]
+    if len(block) < IDX_PAGE_SIZE:
+        raise ValueError(f"page {page_index} is out of range")
+
+    header_words = [struct.unpack_from(">I", block, offset)[0] for offset in range(0, IDX_OBSERVED_HEADER_BYTES, 4)]
+    header_page_pointers = [
+        value
+        for value in header_words
+        if page_offset + IDX_OBSERVED_HEADER_BYTES <= value < page_offset + IDX_PAGE_SIZE
+    ]
+    first_node_abs = min(header_page_pointers) if header_page_pointers else header_words[0]
+    last_nonzero = last_nonzero_offset(block)
+    page_end_used = last_nonzero + 1 if last_nonzero >= 0 else 0
+
+    nodes: list[dict[str, object]] = []
+    groups: dict[int, list[dict[str, object]]] = {}
+    current_abs = first_node_abs
+    seen_offsets: set[int] = set()
+    while (
+        len(nodes) < max_nodes
+        and page_offset <= current_abs < page_offset + IDX_PAGE_SIZE
+    ):
+        rel = current_abs - page_offset
+        if rel in seen_offsets or rel + IDX_OBSERVED_NODE_BYTES > IDX_PAGE_SIZE:
+            break
+        seen_offsets.add(rel)
+        words = [struct.unpack_from(">I", block, rel + off)[0] for off in range(0, IDX_OBSERVED_NODE_BYTES, 4)]
+        next_abs = words[5]
+        next_rel = next_abs - page_offset if page_offset <= next_abs < page_offset + IDX_PAGE_SIZE else None
+        payload_start = rel + IDX_OBSERVED_NODE_BYTES
+        if next_rel is not None and next_rel > payload_start:
+            payload_end = next_rel
+        else:
+            payload_end = page_end_used
+        payload = block[payload_start:payload_end] if payload_end > payload_start else b""
+        payload_text = decode_observed_idx_payload_text(payload)
+        annotations = [annotate_u32_value(value, annotation_maps) for value in words]
+        node = {
+            "start_offset": page_offset + rel,
+            "start_rel": rel,
+            "words": [f"0x{value:08x}" for value in words],
+            "word_annotations": annotations,
+            "payload_length": len(payload),
+            "payload_text": payload_text,
+            "next_offset": next_abs if next_rel is not None else None,
+            "next_rel": next_rel,
+        }
+        nodes.append(node)
+        groups.setdefault(words[0], []).append(node)
+        if next_rel is None or next_abs == 0:
+            break
+        current_abs = next_abs
+
+    group_summaries = []
+    for anchor_value, grouped_nodes in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))[:max_groups]:
+        group_summaries.append(
+            {
+                "anchor_value": anchor_value,
+                "anchor_value_hex": f"0x{anchor_value:08x}",
+                "anchor_annotation": annotate_u32_value(anchor_value, annotation_maps),
+                "node_count": len(grouped_nodes),
+                "payload_texts": [node["payload_text"] for node in grouped_nodes if node["payload_text"]][:8],
+                "fieldish_annotations": sorted(
+                    {
+                        annotation
+                        for node in grouped_nodes
+                        for annotation in node["word_annotations"]
+                        if annotation and annotation.startswith(("field:", "field_aux:"))
+                    }
+                ),
+            }
+        )
+
+    return {
+        "page_index": page_index,
+        "offset": page_offset,
+        "nonzero_bytes": sum(1 for byte in block if byte),
+        "header_words": [f"0x{value:08x}" for value in header_words],
+        "header_annotations": [annotate_u32_value(value, annotation_maps) for value in header_words],
+        "header_page_pointers": [f"0x{value:08x}" for value in header_page_pointers],
+        "observed_first_node_offset": first_node_abs,
+        "observed_last_nonzero_offset": page_offset + last_nonzero if last_nonzero >= 0 else None,
+        "parsed_node_count": len(nodes),
+        "nodes": nodes,
+        "anchor_groups": group_summaries,
+    }
+
+
 def render_dat_tree_node(
     record: DatRecord,
     children_by_parent: dict[int, list[DatRecord]],
@@ -1668,6 +1776,40 @@ def command_idx_page_map(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_idx_observed_page(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    files = find_db_files(root)
+    db_idx = files["db.idx"].read_bytes()
+    db_dic = files["db.dic"].read_bytes()
+    db_dat = files["db.dat"].read_bytes()
+    dic_fields = parse_db_dic(db_dic)
+    dat_records = collect_dat_records(db_dat)
+    annotation_maps = build_annotation_maps(dic_fields, dat_records)
+
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    selected_pages = range(page_count) if args.page is None else [args.page]
+    pages = [
+        parse_observed_idx_page(
+            db_idx,
+            page_index,
+            annotation_maps,
+            max_nodes=args.max_nodes,
+            max_groups=args.max_groups,
+        )
+        for page_index in selected_pages
+    ]
+
+    report = {
+        "root": str(root),
+        "page_size": IDX_PAGE_SIZE,
+        "page_count": page_count,
+        "pages": pages,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def command_dat_tree(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     files = find_db_files(root)
@@ -2157,6 +2299,13 @@ def build_parser() -> argparse.ArgumentParser:
     idx_page_map.add_argument("--max-samples", type=int, default=3, help="Maximum sample strings/refs per page")
     idx_page_map.add_argument("--include-empty", action="store_true", help="Include fully zeroed pages")
     idx_page_map.set_defaults(func=command_idx_page_map)
+
+    idx_observed_page = subparsers.add_parser("idx-observed-page", help="Parse db.idx pages using the observed chained-node layout heuristic.")
+    idx_observed_page.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    idx_observed_page.add_argument("--page", type=int, help="Optional 0-based page index to inspect")
+    idx_observed_page.add_argument("--max-nodes", type=int, default=64, help="Maximum chained nodes to parse per page")
+    idx_observed_page.add_argument("--max-groups", type=int, default=24, help="Maximum anchor groups to summarize per page")
+    idx_observed_page.set_defaults(func=command_idx_observed_page)
 
     dat_tree = subparsers.add_parser("dat-tree", help="Render the parseable db.dat object records as a parent/child tree.")
     dat_tree.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")

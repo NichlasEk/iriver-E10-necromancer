@@ -35,6 +35,7 @@ python3 e10db_tool.py u32-context /run/media/nichlas/E10 db.idx 0xbc --endian bi
 python3 e10db_tool.py media-xref /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py dat-tree /run/media/nichlas/E10
 python3 e10db_tool.py idx-page-map /run/media/nichlas/E10 --page 7
+python3 e10db_tool.py idx-observed-page /run/media/nichlas/E10 --page 7
 python3 e10db_tool.py media-cluster /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py model-export /run/media/nichlas/E10
 python3 e10db_tool.py source-model /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
@@ -52,6 +53,7 @@ What the current tooling gives us:
 - `media-xref` resolves one exact title or file name across both files and shows the `db.dat` record header plus the matching `db.idx` pointer refs.
 - `dat-tree` renders the parseable `db.dat` object records as a parent/child tree. By default it focuses on the validated folder/file kinds (`0x100`, `0x200`), which is useful for modeling folder/file identity and object IDs without the noisier unknown record shapes.
 - `idx-page-map` summarizes `db.idx` page by page with inline UTF-16BE strings, `db.dat` record pointers, and `db.dic` field-entry references.
+- `idx-observed-page` parses one real `db.idx` page using the current chained-node heuristic, exposing header words, absolute next pointers, payload text, and anchor-group patterns.
 - `media-cluster` groups the `db.idx` pages that mention one exact media string, so one track can be studied as a cross-page cluster instead of a single hit.
 - `model-export` builds a normalized per-file model from validated folder/file records, inferred ancestry, index coverage, and a simple canonicalization pass over duplicates.
 - `source-model` builds the same kind of normalized source view from one or more selected filesystem directories.
@@ -101,6 +103,12 @@ What `write-rebuild-prototype` gives us:
 - The current serializer path can now be run as one command for either one selected subtree or the full `Music/` library.
 - The output bundle is self-contained for debugging and iteration: snapshot JSON, `db.dat.prototype`, `db.idx.prototype`, and the reference `db.dic`.
 - This is the current handoff boundary for turning the prototype formats into real E10-compatible database files.
+
+What `idx-observed-page` has shown so far:
+- On real chained pages like page 7, the header contains at least one absolute pointer back into the same page; that pointer is a strong candidate for the first node in the page-local chain.
+- The sixth node word behaves like an absolute next pointer. Following it on page 7 yields a stable 10-node chain.
+- The first node word is stable across several adjacent nodes and looks like an anchor for one logical media object. On page 7, `0x0002060c` spans seven nodes and carries three separate `Saturday Night` payloads.
+- The fifth node word varies in a small integer range such as `1`, `2`, and `7`, which now looks more like a real node-type or field-kind discriminator than random metadata.
 
 Current working hypothesis:
 - The player database is closer to an object store than a flat list.
