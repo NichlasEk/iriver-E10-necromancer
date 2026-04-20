@@ -46,6 +46,8 @@ python3 e10db_tool.py write-rebuild-snapshot /run/media/nichlas/E10 /tmp/e10_sna
 python3 e10db_tool.py write-dbdat-prototype /run/media/nichlas/E10 /tmp/e10_dbdat_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py write-idx-prototype /run/media/nichlas/E10 /tmp/e10_idx_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py write-rebuild-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
+python3 e10db_tool.py test-install-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto
+python3 e10db_tool.py restore-system-backup /run/media/nichlas/E10 /tmp/iriver-e10-backup-YYYYMMDD-HHMMSS
 ```
 
 What the current tooling gives us:
@@ -130,6 +132,12 @@ What the current prototype serializer does with that:
   - one synthetic `non_dat_metadata` chain anchored by `0x20000 + object_id`
 - It also emits `dat_folder` chains for the folder records from the `db.dat` prototype.
 - On the current podcast rebuild bundle this yields one file-chain, one title-chain, and one metadata-chain for each of the 586 target entries.
+
+What `test-install-prototype` does:
+- It validates the bundle manifest against the generated `db.dat.prototype` and `db.idx.prototype`.
+- It pads those prototype files up to the current device file lengths before installation, so the player still sees the expected `System/db.dat` and `System/db.idx` sizes.
+- It writes a full backup of `System/db.dat`, `System/db.idx`, and `System/db.dic` to a timestamped directory under `/tmp` before replacing anything.
+- `restore-system-backup` can then put the original files back if the firmware does not accept the test install.
 
 Current working hypothesis:
 - The player database is closer to an object store than a flat list.

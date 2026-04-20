@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import struct
 import subprocess
 import sys
 import unicodedata
 import zlib
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -1300,6 +1303,18 @@ def stable_idx_text_value(text: str) -> int:
     return zlib.crc32(text.encode("utf-16be")) & 0xFFFFFFFF
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pad_bytes_to_length(data: bytes, target_length: int, label: str) -> bytes:
+    if len(data) > target_length:
+        raise ValueError(f"{label} is larger than target length: {len(data)} > {target_length}")
+    if len(data) == target_length:
+        return data
+    return data + (b"\x00" * (target_length - len(data)))
+
+
 def build_idx_prototype_pages(
     root: Path,
     target_library: list[TargetLibraryEntry],
@@ -2488,6 +2503,167 @@ def command_write_rebuild_prototype(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_test_install_prototype(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    bundle_dir = Path(args.bundle_dir).resolve()
+    files = find_db_files(root)
+
+    manifest_path = bundle_dir / "manifest.json"
+    dbdat_proto_path = bundle_dir / "db.dat.prototype"
+    idx_proto_path = bundle_dir / "db.idx.prototype"
+    dic_reference_path = bundle_dir / "db.dic.reference"
+    missing = [
+        str(path.name)
+        for path in [manifest_path, dbdat_proto_path, idx_proto_path, dic_reference_path]
+        if not path.exists()
+    ]
+    if missing:
+        raise FileNotFoundError(f"Missing prototype bundle files under {bundle_dir}: {', '.join(missing)}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    dbdat_proto = dbdat_proto_path.read_bytes()
+    idx_proto = idx_proto_path.read_bytes()
+    dic_reference = dic_reference_path.read_bytes()
+    current_dbdat = files["db.dat"].read_bytes()
+    current_idx = files["db.idx"].read_bytes()
+    current_dic = files["db.dic"].read_bytes()
+
+    reparsed_records = validated_folder_file_records(dbdat_proto)
+    reparsed_pages = parse_idx_prototype_pages(idx_proto)
+    if manifest.get("root") and str(root) != manifest["root"]:
+        raise ValueError(f"Bundle root mismatch: manifest has {manifest['root']}, requested root is {root}")
+    if manifest.get("dbdat_record_count") is not None and len(reparsed_records) != manifest["dbdat_record_count"]:
+        raise ValueError("db.dat prototype record count does not match manifest")
+    if manifest.get("idx_page_count") is not None and len(reparsed_pages) != manifest["idx_page_count"]:
+        raise ValueError("db.idx prototype page count does not match manifest")
+    if dic_reference != current_dic and not args.replace_dic:
+        raise ValueError("db.dic.reference does not match the current device db.dic; rerun with --replace-dic only if intentional")
+
+    padded_dbdat = pad_bytes_to_length(dbdat_proto, len(current_dbdat), "db.dat prototype")
+    padded_idx = pad_bytes_to_length(idx_proto, len(current_idx), "db.idx prototype")
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else Path("/tmp") / f"iriver-e10-backup-{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    backup_dbdat = backup_dir / "db.dat.backup"
+    backup_idx = backup_dir / "db.idx.backup"
+    backup_dic = backup_dir / "db.dic.backup"
+    backup_dbdat.write_bytes(current_dbdat)
+    backup_idx.write_bytes(current_idx)
+    backup_dic.write_bytes(current_dic)
+
+    install_manifest = {
+        "root": str(root),
+        "bundle_dir": str(bundle_dir),
+        "backup_dir": str(backup_dir),
+        "timestamp": timestamp,
+        "current_sizes": {
+            "db.dat": len(current_dbdat),
+            "db.idx": len(current_idx),
+            "db.dic": len(current_dic),
+        },
+        "prototype_sizes": {
+            "db.dat.prototype": len(dbdat_proto),
+            "db.idx.prototype": len(idx_proto),
+        },
+        "installed_sizes": {
+            "db.dat": len(padded_dbdat),
+            "db.idx": len(padded_idx),
+        },
+        "sha256": {
+            "current_db.dat": sha256_bytes(current_dbdat),
+            "current_db.idx": sha256_bytes(current_idx),
+            "current_db.dic": sha256_bytes(current_dic),
+            "prototype_db.dat": sha256_bytes(dbdat_proto),
+            "prototype_db.idx": sha256_bytes(idx_proto),
+            "prototype_db.dic": sha256_bytes(dic_reference),
+            "installed_db.dat": sha256_bytes(padded_dbdat),
+            "installed_db.idx": sha256_bytes(padded_idx),
+        },
+        "manifest_counts": {
+            "target_library_entry_count": manifest.get("target_library_entry_count"),
+            "planned_addition_count": manifest.get("planned_addition_count"),
+            "dbdat_record_count": manifest.get("dbdat_record_count"),
+            "idx_page_count": manifest.get("idx_page_count"),
+        },
+    }
+    (backup_dir / "install_manifest.json").write_text(json.dumps(install_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    dbdat_tmp = files["db.dat"].with_name("db.dat.codex-new")
+    idx_tmp = files["db.idx"].with_name("db.idx.codex-new")
+    dic_tmp = files["db.dic"].with_name("db.dic.codex-new")
+    try:
+        dbdat_tmp.write_bytes(padded_dbdat)
+        idx_tmp.write_bytes(padded_idx)
+        if args.replace_dic:
+            dic_tmp.write_bytes(dic_reference)
+
+        dbdat_tmp.replace(files["db.dat"])
+        idx_tmp.replace(files["db.idx"])
+        if args.replace_dic:
+            dic_tmp.replace(files["db.dic"])
+    finally:
+        for tmp_path in [dbdat_tmp, idx_tmp, dic_tmp]:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    report = {
+        "root": str(root),
+        "bundle_dir": str(bundle_dir),
+        "backup_dir": str(backup_dir),
+        "installed": True,
+        "replaced_dic": bool(args.replace_dic),
+        "record_count": len(reparsed_records),
+        "page_count": len(reparsed_pages),
+        "installed_sizes": {
+            "db.dat": len(padded_dbdat),
+            "db.idx": len(padded_idx),
+            "db.dic": len(dic_reference if args.replace_dic else current_dic),
+        },
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def command_restore_system_backup(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    backup_dir = Path(args.backup_dir).resolve()
+    files = find_db_files(root)
+    backup_paths = {
+        "db.dat": backup_dir / "db.dat.backup",
+        "db.idx": backup_dir / "db.idx.backup",
+        "db.dic": backup_dir / "db.dic.backup",
+    }
+    missing = [name for name, path in backup_paths.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing backup files under {backup_dir}: {', '.join(missing)}")
+
+    tmp_paths = {
+        name: files[name].with_name(f"{name}.codex-restore")
+        for name in backup_paths
+    }
+    try:
+        for name, backup_path in backup_paths.items():
+            tmp_paths[name].write_bytes(backup_path.read_bytes())
+        for name, path in tmp_paths.items():
+            path.replace(files[name])
+    finally:
+        for path in tmp_paths.values():
+            if path.exists():
+                path.unlink()
+
+    report = {
+        "root": str(root),
+        "backup_dir": str(backup_dir),
+        "restored": True,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local tooling for exploring the iRiver E10 database files.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2633,6 +2809,18 @@ def build_parser() -> argparse.ArgumentParser:
     write_rebuild_prototype.add_argument("--inventory", action="append", help="Optional inventory JSON files, in the same order as media_dirs")
     write_rebuild_prototype.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
     write_rebuild_prototype.set_defaults(func=command_write_rebuild_prototype)
+
+    test_install_prototype = subparsers.add_parser("test-install-prototype", help="Install one rebuild prototype bundle onto the mounted player after backing up the current System/db.* files.")
+    test_install_prototype.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    test_install_prototype.add_argument("bundle_dir", help="Prototype bundle directory produced by write-rebuild-prototype")
+    test_install_prototype.add_argument("--backup-dir", help="Optional directory for the automatic backup copy")
+    test_install_prototype.add_argument("--replace-dic", action="store_true", help="Also replace db.dic with the bundle reference copy if needed")
+    test_install_prototype.set_defaults(func=command_test_install_prototype)
+
+    restore_system_backup = subparsers.add_parser("restore-system-backup", help="Restore System/db.* from a backup directory created by test-install-prototype.")
+    restore_system_backup.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    restore_system_backup.add_argument("backup_dir", help="Backup directory created by test-install-prototype")
+    restore_system_backup.set_defaults(func=command_restore_system_backup)
 
     return parser
 

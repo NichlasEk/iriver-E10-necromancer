@@ -96,6 +96,18 @@ The bundle currently writes:
 - `db.idx.pages.json`
 - `db.dic.reference`
 
+Install one prototype bundle onto the mounted player with an automatic backup:
+
+```bash
+python3 e10db_tool.py test-install-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto
+```
+
+Restore the original `System/db.*` files from that backup if needed:
+
+```bash
+python3 e10db_tool.py restore-system-backup /run/media/nichlas/E10 /tmp/iriver-e10-backup-YYYYMMDD-HHMMSS
+```
+
 ## Notes
 
 - The repository intentionally does not vendor PMPlib or other third-party source trees with uncertain mixed licensing.
