@@ -562,42 +562,98 @@ def parse_observed_idx_page(
 
     nodes: list[dict[str, object]] = []
     groups: dict[int, list[dict[str, object]]] = {}
-    current_abs = first_node_abs
-    seen_offsets: set[int] = set()
-    while (
-        len(nodes) < max_nodes
-        and page_offset <= current_abs < page_offset + IDX_PAGE_SIZE
-    ):
-        rel = current_abs - page_offset
-        if rel in seen_offsets or rel + IDX_OBSERVED_NODE_BYTES > IDX_PAGE_SIZE:
-            break
-        seen_offsets.add(rel)
+    chains: list[dict[str, object]] = []
+    node_offsets_in_order: list[int] = []
+
+    def parse_candidate_node(rel: int) -> tuple[list[int], bytes, str | None] | None:
+        if rel + IDX_OBSERVED_NODE_BYTES > IDX_PAGE_SIZE:
+            return None
         words = [struct.unpack_from(">I", block, rel + off)[0] for off in range(0, IDX_OBSERVED_NODE_BYTES, 4)]
         next_abs = words[5]
         next_rel = next_abs - page_offset if page_offset <= next_abs < page_offset + IDX_PAGE_SIZE else None
+        if next_rel is not None and next_rel <= rel + IDX_OBSERVED_NODE_BYTES:
+            return None
         payload_start = rel + IDX_OBSERVED_NODE_BYTES
         if next_rel is not None and next_rel > payload_start:
             payload_end = next_rel
         else:
             payload_end = page_end_used
-        payload = block[payload_start:payload_end] if payload_end > payload_start else b""
+        if payload_end <= payload_start:
+            payload = b""
+        else:
+            payload = block[payload_start:payload_end]
         payload_text = decode_observed_idx_payload_text(payload)
-        annotations = [annotate_u32_value(value, annotation_maps) for value in words]
-        node = {
-            "start_offset": page_offset + rel,
-            "start_rel": rel,
-            "words": [f"0x{value:08x}" for value in words],
-            "word_annotations": annotations,
-            "payload_length": len(payload),
-            "payload_text": payload_text,
-            "next_offset": next_abs if next_rel is not None else None,
-            "next_rel": next_rel,
-        }
-        nodes.append(node)
-        groups.setdefault(words[0], []).append(node)
-        if next_rel is None or next_abs == 0:
+        return words, payload, payload_text
+
+    def consume_chain(start_abs: int) -> None:
+        current_abs = start_abs
+        chain_start_index = len(nodes)
+        while (
+            len(nodes) < max_nodes
+            and page_offset <= current_abs < page_offset + IDX_PAGE_SIZE
+        ):
+            rel = current_abs - page_offset
+            if rel in seen_offsets or rel + IDX_OBSERVED_NODE_BYTES > IDX_PAGE_SIZE:
+                break
+            parsed = parse_candidate_node(rel)
+            if parsed is None:
+                break
+            words, payload, payload_text = parsed
+            next_abs = words[5]
+            next_rel = next_abs - page_offset if page_offset <= next_abs < page_offset + IDX_PAGE_SIZE else None
+            seen_offsets.add(rel)
+            node_offsets_in_order.append(rel)
+            annotations = [annotate_u32_value(value, annotation_maps) for value in words]
+            node = {
+                "start_offset": page_offset + rel,
+                "start_rel": rel,
+                "words": [f"0x{value:08x}" for value in words],
+                "word_annotations": annotations,
+                "payload_length": len(payload),
+                "payload_text": payload_text,
+                "next_offset": next_abs if next_rel is not None else None,
+                "next_rel": next_rel,
+            }
+            nodes.append(node)
+            groups.setdefault(words[0], []).append(node)
+            if next_rel is None or next_abs == 0:
+                break
+            current_abs = next_abs
+        chain_nodes = nodes[chain_start_index:]
+        if chain_nodes:
+            anchor_word = int(chain_nodes[0]["words"][0], 16)
+            chains.append(
+                {
+                    "start_offset": chain_nodes[0]["start_offset"],
+                    "start_rel": chain_nodes[0]["start_rel"],
+                    "node_count": len(chain_nodes),
+                    "anchor_value": anchor_word,
+                    "anchor_value_hex": chain_nodes[0]["words"][0],
+                    "anchor_annotation": chain_nodes[0]["word_annotations"][0],
+                    "payload_texts": [node["payload_text"] for node in chain_nodes if node["payload_text"]][:8],
+                }
+            )
+
+    current_abs = first_node_abs
+    seen_offsets: set[int] = set()
+    consume_chain(current_abs)
+
+    for rel in range(IDX_OBSERVED_HEADER_BYTES, IDX_PAGE_SIZE - IDX_OBSERVED_NODE_BYTES + 1, 2):
+        if rel in seen_offsets:
+            continue
+        parsed = parse_candidate_node(rel)
+        if parsed is None:
+            continue
+        words, payload, payload_text = parsed
+        next_abs = words[5]
+        next_rel = next_abs - page_offset if page_offset <= next_abs < page_offset + IDX_PAGE_SIZE else None
+        if next_rel is None or next_rel <= rel + IDX_OBSERVED_NODE_BYTES:
+            continue
+        if payload_text is None:
+            continue
+        consume_chain(page_offset + rel)
+        if len(nodes) >= max_nodes:
             break
-        current_abs = next_abs
 
     group_summaries = []
     for anchor_value, grouped_nodes in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))[:max_groups]:
@@ -629,6 +685,8 @@ def parse_observed_idx_page(
         "observed_first_node_offset": first_node_abs,
         "observed_last_nonzero_offset": page_offset + last_nonzero if last_nonzero >= 0 else None,
         "parsed_node_count": len(nodes),
+        "chain_count": len(chains),
+        "chains": chains,
         "nodes": nodes,
         "anchor_groups": group_summaries,
     }
