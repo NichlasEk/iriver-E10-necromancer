@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import unicodedata
+import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -1295,6 +1296,10 @@ def pack_utf16be_null_terminated(text: str) -> bytes:
     return text.encode("utf-16be") + b"\x00\x00"
 
 
+def stable_idx_text_value(text: str) -> int:
+    return zlib.crc32(text.encode("utf-16be")) & 0xFFFFFFFF
+
+
 def build_idx_prototype_pages(
     root: Path,
     target_library: list[TargetLibraryEntry],
@@ -1305,31 +1310,42 @@ def build_idx_prototype_pages(
         field.name: field.entry_offset
         for field in parse_db_dic(db_dic)
     }
+    _ = root
     dbdat_by_target_path = {
         record.target_path: record
         for record in dbdat_records
         if record.kind == 0x200
     }
+    folder_records = sorted(
+        (record for record in dbdat_records if record.kind == 0x100),
+        key=lambda record: (record.target_path.lower(), record.record_start),
+    )
 
     pages: list[bytes] = []
     page_summaries: list[dict[str, object]] = []
-    current_items: list[dict[str, object]] = []
+    current_chains: list[dict[str, object]] = []
     current_nodes: list[dict[str, object]] = []
     current_offset = IDX_OBSERVED_HEADER_BYTES
 
-    text_node_specs = [
-        ("FilePath", lambda entry: entry.target_path, 0x11),
-        ("FileName", lambda entry: entry.file_name, 0x02),
-        ("Title", lambda entry: target_title_for_idx(entry), 0x07),
-        ("Artist", lambda entry: entry.artist or "", 0x08),
-        ("Album", lambda entry: entry.album or "", 0x04),
-        ("Genre", lambda entry: entry.genre or "", 0x05),
-    ]
-    numeric_node_specs = [
-        ("Duration", lambda entry: int((entry.duration_seconds or 0) * 1000), 0x21),
-        ("BitRate", lambda entry: entry.bit_rate_bps or 0, 0x22),
-        ("SampleRate", lambda entry: entry.sample_rate_hz or 0, 0x23),
-    ]
+    def make_text_node(field_name: str, node_type: int, text: str) -> dict[str, object]:
+        return {
+            "field_name": field_name,
+            "field_entry_offset": field_offsets.get(field_name, 0),
+            "value": stable_idx_text_value(text),
+            "node_type": node_type,
+            "payload": pack_utf16be_null_terminated(text),
+            "payload_text": text,
+        }
+
+    def make_numeric_node(field_name: str, node_type: int, value: int) -> dict[str, object]:
+        return {
+            "field_name": field_name,
+            "field_entry_offset": field_offsets.get(field_name, 0),
+            "value": value,
+            "node_type": node_type,
+            "payload": b"",
+            "payload_text": "",
+        }
 
     def finalize_page(page_index: int) -> None:
         nonlocal current_offset
@@ -1342,17 +1358,17 @@ def build_idx_prototype_pages(
         struct.pack_into(">I", page, 0, first_node_abs_offset)
         struct.pack_into(">I", page, 4, last_node_abs_offset)
         struct.pack_into(">I", page, 8, len(current_nodes))
-        struct.pack_into(">I", page, 12, len(current_items))
-        struct.pack_into(">I", page, 16, current_items[0]["dat_record_start"])
-        struct.pack_into(">I", page, 20, current_items[-1]["dat_record_start"])
-        struct.pack_into(">I", page, 24, current_items[0]["object_id"])
+        struct.pack_into(">I", page, 12, len(current_chains))
+        struct.pack_into(">I", page, 16, current_chains[0]["anchor_value"])
+        struct.pack_into(">I", page, 20, current_chains[-1]["anchor_value"])
+        struct.pack_into(">I", page, 24, current_chains[0]["object_id"])
         struct.pack_into(">I", page, 28, current_offset)
 
-        for index, node in enumerate(current_nodes):
+        for node in current_nodes:
             base = node["start_rel"]
-            next_rel = current_nodes[index + 1]["start_rel"] if index + 1 < len(current_nodes) else 0
+            next_rel = node["next_rel"]
             next_abs = page_base + next_rel if next_rel else 0
-            struct.pack_into(">I", page, base + 0, node["dat_record_start"])
+            struct.pack_into(">I", page, base + 0, node["anchor_value"])
             struct.pack_into(">I", page, base + 4, node["object_id"])
             struct.pack_into(">I", page, base + 8, node["field_entry_offset"])
             struct.pack_into(">I", page, base + 12, node["value"])
@@ -1365,84 +1381,133 @@ def build_idx_prototype_pages(
         page_summaries.append(
             {
                 "page_index": page_index,
-                "item_count": len(current_items),
+                "item_count": len(current_chains),
+                "chain_count": len(current_chains),
                 "node_count": len(current_nodes),
                 "first_node_abs_offset": first_node_abs_offset,
                 "last_node_abs_offset": last_node_abs_offset,
                 "bytes_used": current_offset,
                 "items": [
                     {
+                        "chain_family": item["chain_family"],
                         "target_path": item["target_path"],
                         "object_id": item["object_id"],
-                        "dat_record_start": item["dat_record_start"],
+                        "anchor_value": item["anchor_value"],
+                        "anchor_value_hex": f"0x{item['anchor_value']:08x}",
                         "flags": item["flags"],
                         "node_count": item["node_count"],
                     }
-                    for item in current_items
+                    for item in current_chains
                 ],
             }
         )
-        current_items.clear()
+        current_chains.clear()
         current_nodes.clear()
         current_offset = IDX_OBSERVED_HEADER_BYTES
 
-    sorted_entries = sorted(target_library, key=lambda entry: entry.target_path.lower())
-    for entry in sorted_entries:
+    chain_specs: list[dict[str, object]] = []
+
+    for record in folder_records:
+        folder_name = clean_folder_name(record.text) + "/"
+        chain_specs.append(
+            {
+                "chain_family": "dat_folder",
+                "target_path": record.target_path,
+                "object_id": record.object_id,
+                "anchor_value": record.record_start,
+                "flags": 1,
+                "nodes": [make_text_node("FilePath", 0x05, folder_name)],
+            }
+        )
+
+    for entry in sorted(target_library, key=lambda item: item.target_path.lower()):
         dbdat_record = dbdat_by_target_path.get(entry.target_path)
         if dbdat_record is None:
             continue
-        entry_nodes: list[dict[str, object]] = []
-        for field_name, getter, node_type in text_node_specs:
-            text = getter(entry)
-            if not text:
-                continue
-            entry_nodes.append(
-                {
-                    "field_name": field_name,
-                    "field_entry_offset": field_offsets.get(field_name, 0),
-                    "value": 0,
-                    "node_type": node_type,
-                    "payload": pack_utf16be_null_terminated(text),
-                    "payload_text": text,
-                }
-            )
-        for field_name, getter, node_type in numeric_node_specs:
-            value = getter(entry)
-            if not value:
-                continue
-            entry_nodes.append(
-                {
-                    "field_name": field_name,
-                    "field_entry_offset": field_offsets.get(field_name, 0),
-                    "value": value,
-                    "node_type": node_type,
-                    "payload": b"",
-                    "payload_text": "",
-                }
-            )
+        flags = 1 if entry.source_kind == "existing" else 2
+        title_text = target_title_for_idx(entry)
 
-        entry_size = sum(IDX_OBSERVED_NODE_BYTES + len(node["payload"]) for node in entry_nodes)
-        if current_items and current_offset + entry_size > IDX_PAGE_SIZE:
-            finalize_page(len(pages))
-        if IDX_OBSERVED_HEADER_BYTES + entry_size > IDX_PAGE_SIZE:
-            raise ValueError(f"One observed idx prototype item exceeds page size: {entry.target_path}")
-
-        item_node_count = 0
-        for node in entry_nodes:
-            node["dat_record_start"] = dbdat_record.record_start
-            node["object_id"] = dbdat_record.object_id
-            node["start_rel"] = current_offset
-            current_nodes.append(node)
-            current_offset += IDX_OBSERVED_NODE_BYTES + len(node["payload"])
-            item_node_count += 1
-
-        current_items.append(
+        chain_specs.append(
             {
+                "chain_family": "dat_audio_file",
                 "target_path": entry.target_path,
                 "object_id": dbdat_record.object_id,
-                "dat_record_start": dbdat_record.record_start,
-                "flags": 1 if entry.source_kind == "existing" else 2,
-                "node_count": item_node_count,
+                "anchor_value": dbdat_record.record_start,
+                "flags": flags,
+                "nodes": [make_text_node("FileName", 0x03, entry.file_name)],
+            }
+        )
+
+        if title_text and title_text != entry.file_name:
+            chain_specs.append(
+                {
+                    "chain_family": "dat_audio_title",
+                    "target_path": entry.target_path,
+                    "object_id": dbdat_record.object_id,
+                    "anchor_value": dbdat_record.record_start,
+                    "flags": flags,
+                    "nodes": [make_text_node("Title", 0x09, title_text)],
+                }
+            )
+
+        metadata_nodes: list[dict[str, object]] = []
+        if entry.artist:
+            metadata_nodes.append(make_text_node("Artist", 0x02, entry.artist))
+        if entry.genre:
+            metadata_nodes.append(make_text_node("Genre", 0x03, entry.genre))
+        if entry.album:
+            metadata_nodes.append(make_text_node("Album", 0x04, entry.album))
+        if title_text:
+            metadata_nodes.append(make_text_node("Title", 0x07, title_text))
+        duration_ms = int((entry.duration_seconds or 0) * 1000)
+        if duration_ms:
+            metadata_nodes.append(make_numeric_node("Duration", 0x01, duration_ms))
+        if entry.bit_rate_bps:
+            metadata_nodes.append(make_numeric_node("BitRate", 0x01, entry.bit_rate_bps))
+        if entry.sample_rate_hz:
+            metadata_nodes.append(make_numeric_node("SampleRate", 0x01, entry.sample_rate_hz))
+        if metadata_nodes:
+            chain_specs.append(
+                {
+                    "chain_family": "non_dat_metadata",
+                    "target_path": entry.target_path,
+                    "object_id": dbdat_record.object_id,
+                    "anchor_value": 0x20000 + dbdat_record.object_id,
+                    "flags": flags,
+                    "nodes": metadata_nodes,
+                }
+            )
+
+    chain_specs.sort(key=lambda item: (item["target_path"].lower(), item["chain_family"], item["anchor_value"]))
+
+    for chain in chain_specs:
+        chain_size = sum(IDX_OBSERVED_NODE_BYTES + len(node["payload"]) for node in chain["nodes"])
+        if current_chains and current_offset + chain_size > IDX_PAGE_SIZE:
+            finalize_page(len(pages))
+        if IDX_OBSERVED_HEADER_BYTES + chain_size > IDX_PAGE_SIZE:
+            raise ValueError(f"One observed idx prototype chain exceeds page size: {chain['target_path']} [{chain['chain_family']}]")
+
+        chain_start_rel = current_offset
+        chain_nodes = chain["nodes"]
+        for index, node in enumerate(chain_nodes):
+            node["anchor_value"] = chain["anchor_value"]
+            node["object_id"] = chain["object_id"]
+            node["start_rel"] = current_offset
+            node_size = IDX_OBSERVED_NODE_BYTES + len(node["payload"])
+            next_rel = current_offset + node_size if index + 1 < len(chain_nodes) else 0
+            node["next_rel"] = next_rel
+            current_nodes.append(node)
+            current_offset += node_size
+
+        current_chains.append(
+            {
+                "chain_family": chain["chain_family"],
+                "target_path": chain["target_path"],
+                "object_id": chain["object_id"],
+                "anchor_value": chain["anchor_value"],
+                "flags": chain["flags"],
+                "node_count": len(chain_nodes),
+                "start_rel": chain_start_rel,
             }
         )
 
@@ -1462,7 +1527,7 @@ def parse_idx_prototype_pages(data: bytes) -> list[dict[str, object]]:
         first_node_abs = struct.unpack_from(">I", block, 0)[0]
         last_node_abs = struct.unpack_from(">I", block, 4)[0]
         node_count_header = struct.unpack_from(">I", block, 8)[0]
-        item_count_header = struct.unpack_from(">I", block, 12)[0]
+        chain_count_header = struct.unpack_from(">I", block, 12)[0]
         bytes_used = struct.unpack_from(">I", block, 28)[0]
         nodes = []
         next_abs = first_node_abs
@@ -1499,12 +1564,11 @@ def parse_idx_prototype_pages(data: bytes) -> list[dict[str, object]]:
             if node_next_abs == 0:
                 break
             next_abs = node_next_abs
-        item_count = sum(1 for node in nodes if node["node_type"] == 0x11)
         pages.append(
             {
                 "page_index": page_index,
-                "item_count": item_count,
-                "item_count_header": item_count_header,
+                "item_count": chain_count_header,
+                "item_count_header": chain_count_header,
                 "node_count": len(nodes),
                 "node_count_header": node_count_header,
                 "first_node_abs_offset": first_node_abs,

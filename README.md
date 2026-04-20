@@ -101,4 +101,5 @@ The bundle currently writes:
 - The repository intentionally does not vendor PMPlib or other third-party source trees with uncertain mixed licensing.
 - The current `db.dat` writer only covers the validated folder/file object graph, not the full E10 database model.
 - The current `db.idx` writer now uses an observed chain-style page layout with 24-byte nodes, absolute next-pointers, and inline UTF-16BE payloads, but it is still not the final firmware-compatible layout.
+- The current `db.idx` prototype also emits separate chain families for files, titles, folders, and synthetic metadata anchors instead of one flat chain per entry.
 - The next major step is turning the prototype bundle into a real E10-compatible serializer pair.

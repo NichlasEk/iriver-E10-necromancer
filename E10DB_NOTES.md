@@ -122,6 +122,15 @@ What `idx-observed-summary` has shown so far:
 - `dat_audio` chains are usually short: most are 2-node chains, often one with the extension-bearing filename and another with a title-like payload.
 - `non_dat` chains are where richer metadata appears. They commonly carry artist/genre/album-like payload groups and dominate node types `0x2`, `0x3`, and `0x4`.
 
+What the current prototype serializer does with that:
+- The `db.idx` prototype writer now emits separate chain families instead of one flat chain per entry.
+- For each target audio file it emits:
+  - one `dat_audio_file` chain anchored by the `db.dat` record start
+  - one `dat_audio_title` chain anchored by the same `db.dat` record start
+  - one synthetic `non_dat_metadata` chain anchored by `0x20000 + object_id`
+- It also emits `dat_folder` chains for the folder records from the `db.dat` prototype.
+- On the current podcast rebuild bundle this yields one file-chain, one title-chain, and one metadata-chain for each of the 586 target entries.
+
 Current working hypothesis:
 - The player database is closer to an object store than a flat list.
 - The minimum viable modern workflow is:
