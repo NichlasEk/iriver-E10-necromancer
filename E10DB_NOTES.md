@@ -36,6 +36,7 @@ python3 e10db_tool.py media-xref /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py dat-tree /run/media/nichlas/E10
 python3 e10db_tool.py idx-page-map /run/media/nichlas/E10 --page 7
 python3 e10db_tool.py idx-observed-page /run/media/nichlas/E10 --page 7
+python3 e10db_tool.py idx-observed-summary /run/media/nichlas/E10
 python3 e10db_tool.py media-cluster /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py model-export /run/media/nichlas/E10
 python3 e10db_tool.py source-model /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
@@ -54,6 +55,7 @@ What the current tooling gives us:
 - `dat-tree` renders the parseable `db.dat` object records as a parent/child tree. By default it focuses on the validated folder/file kinds (`0x100`, `0x200`), which is useful for modeling folder/file identity and object IDs without the noisier unknown record shapes.
 - `idx-page-map` summarizes `db.idx` page by page with inline UTF-16BE strings, `db.dat` record pointers, and `db.dic` field-entry references.
 - `idx-observed-page` parses one real `db.idx` page using the current chained-node heuristic, exposing header words, absolute next pointers, payload text, and anchor-group patterns.
+- `idx-observed-summary` scans the full `db.idx` and summarizes the observed chain families by anchor class, node-type distribution, and payload class.
 - `media-cluster` groups the `db.idx` pages that mention one exact media string, so one track can be studied as a cross-page cluster instead of a single hit.
 - `model-export` builds a normalized per-file model from validated folder/file records, inferred ancestry, index coverage, and a simple canonicalization pass over duplicates.
 - `source-model` builds the same kind of normalized source view from one or more selected filesystem directories.
@@ -109,6 +111,16 @@ What `idx-observed-page` has shown so far:
 - The sixth node word behaves like an absolute next pointer. Following it on page 7 yields a stable 10-node chain.
 - The first node word is stable across several adjacent nodes and looks like an anchor for one logical media object. On page 7, `0x0002060c` spans seven nodes and carries three separate `Saturday Night` payloads.
 - The fifth node word varies in a small integer range such as `1`, `2`, and `7`, which now looks more like a real node-type or field-kind discriminator than random metadata.
+- Extending the parser to look for multiple starts per page shows that a single page can contain several independent chains. On page 7, that now includes a playlist chain, a folder chain for `Oasis/`, and a file chain for `01 Hello.wma`.
+
+What `idx-observed-summary` has shown so far:
+- The current snapshot contains about 846 observed chains across 384 pages.
+- Those chains already split into useful families:
+  - about 309 `dat_audio` chains anchored by `db.dat` file records
+  - about 97 `dat_folder` chains anchored by `db.dat` folder records
+  - about 426 `non_dat` chains that look like metadata/object-side chains rather than direct file anchors
+- `dat_audio` chains are usually short: most are 2-node chains, often one with the extension-bearing filename and another with a title-like payload.
+- `non_dat` chains are where richer metadata appears. They commonly carry artist/genre/album-like payload groups and dominate node types `0x2`, `0x3`, and `0x4`.
 
 Current working hypothesis:
 - The player database is closer to an object store than a flat list.

@@ -30,6 +30,7 @@ Inspect the current device database:
 python3 e10db_tool.py db-summary /run/media/nichlas/E10
 python3 e10db_tool.py model-export /run/media/nichlas/E10
 python3 e10db_tool.py idx-observed-page /run/media/nichlas/E10 --page 7
+python3 e10db_tool.py idx-observed-summary /run/media/nichlas/E10
 ```
 
 Plan additions from one selected directory:

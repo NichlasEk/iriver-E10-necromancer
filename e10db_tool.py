@@ -692,6 +692,19 @@ def parse_observed_idx_page(
     }
 
 
+def classify_payload_text(text: str) -> str:
+    suffix = Path(text).suffix.lower()
+    if text.endswith("/"):
+        return "folder"
+    if suffix in AUDIO_EXTENSIONS:
+        return "audio_file"
+    if suffix in PLAYLIST_EXTENSIONS:
+        return "playlist"
+    if "/" in text:
+        return "path_like"
+    return "metadata"
+
+
 def render_dat_tree_node(
     record: DatRecord,
     children_by_parent: dict[int, list[DatRecord]],
@@ -1868,6 +1881,122 @@ def command_idx_observed_page(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_idx_observed_summary(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    files = find_db_files(root)
+    db_idx = files["db.idx"].read_bytes()
+    db_dic = files["db.dic"].read_bytes()
+    db_dat = files["db.dat"].read_bytes()
+    dic_fields = parse_db_dic(db_dic)
+    dat_records = collect_dat_records(db_dat)
+    dat_record_by_start = {record.record_start: record for record in dat_records}
+    annotation_maps = build_annotation_maps(dic_fields, dat_records)
+
+    chain_length_counts: dict[int, int] = {}
+    anchor_class_counts: dict[str, int] = {}
+    anchor_annotation_counts: dict[str, int] = {}
+    node_type_counts: dict[str, int] = {}
+    node_type_by_payload_class: dict[str, dict[str, int]] = {}
+    node_type_by_anchor_class: dict[str, dict[str, int]] = {}
+    anchor_class_examples: dict[str, list[dict[str, object]]] = {}
+
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    for page_index in range(page_count):
+        parsed = parse_observed_idx_page(
+            db_idx,
+            page_index,
+            annotation_maps,
+            max_nodes=args.max_nodes,
+            max_groups=args.max_groups,
+        )
+        for chain in parsed["chains"]:
+            anchor_annotation = chain["anchor_annotation"]
+            anchor_class = "non_dat"
+            if anchor_annotation and anchor_annotation.startswith("dat:"):
+                anchor_text = anchor_annotation[4:]
+                dat_record = dat_record_by_start.get(chain["anchor_value"])
+                if dat_record and dat_record.kind == 0x200:
+                    suffix = Path(anchor_text).suffix.lower()
+                    if suffix in PLAYLIST_EXTENSIONS:
+                        anchor_class = "dat_playlist"
+                    else:
+                        anchor_class = "dat_audio"
+                elif dat_record and dat_record.kind == 0x100:
+                    anchor_class = "dat_folder"
+                else:
+                    anchor_class = "dat_other"
+            chain_length_counts[chain["node_count"]] = chain_length_counts.get(chain["node_count"], 0) + 1
+            anchor_class_counts[anchor_class] = anchor_class_counts.get(anchor_class, 0) + 1
+            if anchor_annotation:
+                anchor_annotation_counts[anchor_annotation] = anchor_annotation_counts.get(anchor_annotation, 0) + 1
+            examples = anchor_class_examples.setdefault(anchor_class, [])
+            if len(examples) < args.example_limit:
+                examples.append(
+                    {
+                        "page_index": parsed["page_index"],
+                        "start_rel": chain["start_rel"],
+                        "anchor_value_hex": chain["anchor_value_hex"],
+                        "anchor_annotation": anchor_annotation,
+                        "node_count": chain["node_count"],
+                        "payload_texts": chain["payload_texts"],
+                    }
+                )
+
+        for node in parsed["nodes"]:
+            node_type = node["words"][4]
+            node_type_counts[node_type] = node_type_counts.get(node_type, 0) + 1
+            anchor_annotation = node["word_annotations"][0]
+            anchor_class = "non_dat"
+            if anchor_annotation and anchor_annotation.startswith("dat:"):
+                anchor_text = anchor_annotation[4:]
+                anchor_start = int(node["words"][0], 16)
+                dat_record = dat_record_by_start.get(anchor_start)
+                if dat_record and dat_record.kind == 0x200:
+                    suffix = Path(anchor_text).suffix.lower()
+                    if suffix in PLAYLIST_EXTENSIONS:
+                        anchor_class = "dat_playlist"
+                    else:
+                        anchor_class = "dat_audio"
+                elif dat_record and dat_record.kind == 0x100:
+                    anchor_class = "dat_folder"
+                else:
+                    anchor_class = "dat_other"
+            bucket = node_type_by_anchor_class.setdefault(node_type, {})
+            bucket[anchor_class] = bucket.get(anchor_class, 0) + 1
+            if node["payload_text"]:
+                payload_class = classify_payload_text(node["payload_text"])
+                bucket = node_type_by_payload_class.setdefault(node_type, {})
+                bucket[payload_class] = bucket.get(payload_class, 0) + 1
+
+    report = {
+        "root": str(root),
+        "page_count": page_count,
+        "chain_count": sum(chain_length_counts.values()),
+        "chain_length_counts": [{"node_count": k, "count": v} for k, v in sorted(chain_length_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
+        "anchor_class_counts": [{"anchor_class": k, "count": v} for k, v in sorted(anchor_class_counts.items(), key=lambda item: (-item[1], item[0]))],
+        "top_anchor_annotations": [{"anchor_annotation": k, "count": v} for k, v in sorted(anchor_annotation_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
+        "node_type_counts": [{"node_type": k, "count": v} for k, v in sorted(node_type_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
+        "node_type_by_payload_class": [
+            {"node_type": node_type, "payload_classes": payloads}
+            for node_type, payloads in sorted(
+                node_type_by_payload_class.items(),
+                key=lambda item: (-sum(item[1].values()), item[0]),
+            )[: args.limit]
+        ],
+        "node_type_by_anchor_class": [
+            {"node_type": node_type, "anchor_classes": classes}
+            for node_type, classes in sorted(
+                node_type_by_anchor_class.items(),
+                key=lambda item: (-sum(item[1].values()), item[0]),
+            )[: args.limit]
+        ],
+        "anchor_class_examples": anchor_class_examples,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
 def command_dat_tree(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     files = find_db_files(root)
@@ -2364,6 +2493,14 @@ def build_parser() -> argparse.ArgumentParser:
     idx_observed_page.add_argument("--max-nodes", type=int, default=64, help="Maximum chained nodes to parse per page")
     idx_observed_page.add_argument("--max-groups", type=int, default=24, help="Maximum anchor groups to summarize per page")
     idx_observed_page.set_defaults(func=command_idx_observed_page)
+
+    idx_observed_summary = subparsers.add_parser("idx-observed-summary", help="Summarize observed chained-node patterns across the full db.idx.")
+    idx_observed_summary.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    idx_observed_summary.add_argument("--max-nodes", type=int, default=64, help="Maximum chained nodes to parse per page")
+    idx_observed_summary.add_argument("--max-groups", type=int, default=24, help="Maximum anchor groups to summarize per page")
+    idx_observed_summary.add_argument("--limit", type=int, default=20, help="Maximum summary rows per section")
+    idx_observed_summary.add_argument("--example-limit", type=int, default=5, help="Maximum example chains per anchor class")
+    idx_observed_summary.set_defaults(func=command_idx_observed_summary)
 
     dat_tree = subparsers.add_parser("dat-tree", help="Render the parseable db.dat object records as a parent/child tree.")
     dat_tree.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
