@@ -22,6 +22,8 @@ IDX_PAGE_SIZE = 0x400
 IDX_PROTO_MAGIC = b"E10IPX1\x00"
 IDX_OBSERVED_HEADER_BYTES = 0x20
 IDX_OBSERVED_NODE_BYTES = 24
+DB_DAT_PREFIX_BYTES = 16
+DB_DAT_RECORD_PADDING_BYTES = 21
 
 
 @dataclass
@@ -70,6 +72,7 @@ class NormalizedMediaEntry:
 class SourceMediaEntry:
     path: str
     relative_path: str
+    target_base_dir: str
     file_name: str
     title: str | None
     artist: str | None
@@ -110,6 +113,34 @@ class TargetDatRecord:
     kind: int
     text: str
     target_path: str
+
+
+@dataclass
+class TargetMetadataBlob:
+    offset: int
+    target_path: str
+    artist: str
+    album: str
+    genre: str
+    title: str
+
+
+@dataclass
+class ObservedIdxNodeTemplate:
+    field_name: str | None
+    node_type: int
+    payload_kind: str
+    payload_role: str | None
+    value_mode: str
+    literal_value: int | None
+
+
+@dataclass
+class ObservedIdxChainTemplate:
+    chain_family: str
+    source_page_index: int
+    source_anchor_annotation: str | None
+    node_templates: list[ObservedIdxNodeTemplate]
 
 
 def is_latinish_char(ch: str) -> bool:
@@ -283,6 +314,27 @@ def normalize_index_string(text: str) -> str:
     return text.strip()
 
 
+def normalize_display_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    replacements = {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_text = " ".join(ascii_text.split()).strip()
+    return ascii_text or None
+
+
 def database_audio_names(db_dat_hits: list[StringHit], db_idx_hits: list[StringHit]) -> list[str]:
     names: set[str] = set()
     for hit in db_dat_hits + db_idx_hits:
@@ -451,8 +503,10 @@ def aligned_u32_refs(data: bytes, value: int, endian: str = "big") -> list[int]:
 
 def kind_name(kind: int) -> str:
     return {
+        0x0: "special",
         0x100: "folder",
         0x200: "file",
+        0x400: "playlist",
     }.get(kind, f"0x{kind:x}")
 
 
@@ -630,6 +684,8 @@ def parse_observed_idx_page(
                 {
                     "start_offset": chain_nodes[0]["start_offset"],
                     "start_rel": chain_nodes[0]["start_rel"],
+                    "node_start_index": chain_start_index,
+                    "node_end_index": len(nodes),
                     "node_count": len(chain_nodes),
                     "anchor_value": anchor_word,
                     "anchor_value_hex": chain_nodes[0]["words"][0],
@@ -707,6 +763,609 @@ def classify_payload_text(text: str) -> str:
     if "/" in text:
         return "path_like"
     return "metadata"
+
+
+def observed_node_field_name(node: dict[str, object]) -> str | None:
+    for annotation in node["word_annotations"]:
+        if annotation and annotation.startswith("field:"):
+            return annotation[6:]
+    return None
+
+
+def observed_chain_family(
+    chain_nodes: list[dict[str, object]],
+    dat_record_by_start: dict[int, DatRecord],
+) -> str:
+    if not chain_nodes:
+        return "empty"
+    anchor_value = int(chain_nodes[0]["words"][0], 16)
+    dat_record = dat_record_by_start.get(anchor_value)
+    field_names = [observed_node_field_name(node) for node in chain_nodes]
+    payload_classes = {
+        classify_payload_text(node["payload_text"])
+        for node in chain_nodes
+        if node["payload_text"]
+    }
+    if dat_record:
+        if dat_record.kind == 0x0:
+            return "dat_special_root"
+        if dat_record.kind == 0x100:
+            return "dat_folder"
+        if dat_record.kind == 0x400:
+            return "dat_playlist"
+        if dat_record.kind == 0x200:
+            if "audio_file" in payload_classes:
+                return "dat_audio_file"
+            if "Title" in field_names or "metadata" in payload_classes:
+                return "dat_audio_title"
+            return "dat_audio_misc"
+        return "dat_other"
+    if any(name in {"Artist", "Album", "Genre", "Title", "Duration", "BitRate", "SampleRate"} for name in field_names):
+        return "non_dat_metadata"
+    return "non_dat_other"
+
+
+def infer_observed_payload_role(
+    field_name: str | None,
+    payload_text: str | None,
+    chain_family: str,
+) -> str | None:
+    if field_name:
+        return field_name
+    if not payload_text:
+        return None
+    payload_class = classify_payload_text(payload_text)
+    if chain_family == "dat_special_root":
+        return "RMusic"
+    if chain_family == "dat_folder" and payload_class == "folder":
+        return "FilePath"
+    if chain_family == "dat_audio_file" and payload_class == "audio_file":
+        return "FileName"
+    if chain_family == "dat_playlist" and payload_class in {"playlist", "audio_file"}:
+        return "FileName"
+    if chain_family == "dat_audio_title" and payload_class == "metadata":
+        return "Title"
+    if chain_family == "non_dat_metadata" and payload_class == "metadata":
+        return "Title"
+    return None
+
+
+def infer_observed_value_mode(
+    field_name: str | None,
+    payload_text: str | None,
+    value: int,
+) -> str:
+    if payload_text:
+        if stable_idx_text_value(payload_text) == value:
+            return "stable_text_crc"
+        if value == 0:
+            return "zero"
+        return "literal"
+    if field_name == "Duration":
+        return "duration_ms"
+    if field_name == "BitRate":
+        return "bit_rate_bps"
+    if field_name == "SampleRate":
+        return "sample_rate_hz"
+    if value == 0:
+        return "zero"
+    return "literal"
+
+
+def observed_chain_to_template(
+    chain_family: str,
+    page_index: int,
+    anchor_annotation: str | None,
+    chain_nodes: list[dict[str, object]],
+) -> ObservedIdxChainTemplate:
+    node_templates: list[ObservedIdxNodeTemplate] = []
+    for node in chain_nodes:
+        field_name = observed_node_field_name(node)
+        payload_text = node["payload_text"]
+        value = int(node["words"][3], 16)
+        payload_kind = "text" if payload_text else "empty"
+        if not payload_text and field_name in {"Duration", "BitRate", "SampleRate"}:
+            payload_kind = "numeric"
+        node_templates.append(
+            ObservedIdxNodeTemplate(
+                field_name=field_name,
+                node_type=int(node["words"][4], 16),
+                payload_kind=payload_kind,
+                payload_role=infer_observed_payload_role(field_name, payload_text, chain_family),
+                value_mode=infer_observed_value_mode(field_name, payload_text, value),
+                literal_value=value if value else None,
+            )
+        )
+    return ObservedIdxChainTemplate(
+        chain_family=chain_family,
+        source_page_index=page_index,
+        source_anchor_annotation=anchor_annotation,
+        node_templates=node_templates,
+    )
+
+
+def observed_chain_template_signature(template: ObservedIdxChainTemplate) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            node.field_name,
+            node.node_type,
+            node.payload_kind,
+            node.payload_role,
+            node.value_mode,
+            node.literal_value,
+        )
+        for node in template.node_templates
+    )
+
+
+def observed_chain_template_score(template: ObservedIdxChainTemplate) -> tuple[int, int, int]:
+    recognized_nodes = sum(
+        1
+        for node in template.node_templates
+        if node.payload_role or node.payload_kind == "empty"
+    )
+    text_nodes = sum(1 for node in template.node_templates if node.payload_kind == "text")
+    return (recognized_nodes, text_nodes, len(template.node_templates))
+
+
+def build_observed_idx_template_library(
+    db_idx: bytes,
+    db_dic: bytes,
+    db_dat: bytes,
+    *,
+    max_nodes: int = 128,
+    max_groups: int = 32,
+) -> dict[str, object]:
+    dic_fields = parse_db_dic(db_dic)
+    dat_records = collect_dat_records(db_dat)
+    dat_record_by_start = {record.record_start: record for record in dat_records}
+    annotation_maps = build_annotation_maps(dic_fields, dat_records)
+
+    variants_by_family: dict[str, dict[tuple[tuple[object, ...], ...], dict[str, object]]] = {}
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    for page_index in range(page_count):
+        parsed = parse_observed_idx_page(
+            db_idx,
+            page_index,
+            annotation_maps,
+            max_nodes=max_nodes,
+            max_groups=max_groups,
+        )
+        for chain in parsed["chains"]:
+            chain_nodes = parsed["nodes"][chain["node_start_index"]:chain["node_end_index"]]
+            chain_family = observed_chain_family(chain_nodes, dat_record_by_start)
+            template = observed_chain_to_template(
+                chain_family,
+                parsed["page_index"],
+                chain["anchor_annotation"],
+                chain_nodes,
+            )
+            signature = observed_chain_template_signature(template)
+            family_variants = variants_by_family.setdefault(chain_family, {})
+            candidate = family_variants.get(signature)
+            if candidate is None:
+                family_variants[signature] = {
+                    "template": template,
+                    "count": 1,
+                    "score": observed_chain_template_score(template),
+                    "example_payloads": chain["payload_texts"],
+                }
+            else:
+                candidate["count"] += 1
+
+    selected_templates: dict[str, ObservedIdxChainTemplate] = {}
+    family_summaries: list[dict[str, object]] = []
+    for family_name, variants in sorted(variants_by_family.items()):
+        ordered_variants = sorted(
+            variants.values(),
+            key=lambda item: (item["score"], item["count"]),
+            reverse=True,
+        )
+        selected_templates[family_name] = ordered_variants[0]["template"]
+        family_summaries.append(
+            {
+                "chain_family": family_name,
+                "variant_count": len(ordered_variants),
+                "selected_template": asdict(ordered_variants[0]["template"]),
+                "variants": [
+                    {
+                        "count": item["count"],
+                        "score": list(item["score"]),
+                        "example_payloads": item["example_payloads"],
+                        "template": asdict(item["template"]),
+                    }
+                    for item in ordered_variants[:8]
+                ],
+            }
+        )
+
+    compact_library = build_observed_compact_idx_template_library(
+        db_idx,
+        db_dic,
+        db_dat,
+    )
+
+    return {
+        "page_count": page_count,
+        "chain_family_count": len(family_summaries),
+        "compact_family_count": compact_library["family_count"],
+        "family_count": len(family_summaries) + compact_library["family_count"],
+        "selected_templates": selected_templates,
+        "family_summaries": family_summaries,
+        "selected_compact_templates": compact_library["selected_templates"],
+        "compact_family_summaries": compact_library["family_summaries"],
+        "compact_metadata_blob_count": compact_library["metadata_blob_count"],
+        "compact_metadata_blob_by_offset": compact_library["metadata_blob_by_offset"],
+        "compact_metadata_blobs": compact_library["metadata_blobs"],
+    }
+
+
+def decode_utf16be_string_at(data: bytes, offset: int, min_chars: int = 1) -> tuple[str, int] | None:
+    if offset < 0 or offset + 1 >= len(data):
+        return None
+    chars: list[str] = []
+    pos = offset
+    while pos + 1 < len(data):
+        codepoint = decode_utf16_codepoint(data, pos, "big")
+        if codepoint == 0:
+            break
+        ch = chr(codepoint)
+        if not is_reasonable_text_char(ch):
+            return None
+        chars.append(ch)
+        pos += 2
+    if len(chars) < min_chars or pos + 1 >= len(data) or data[pos:pos + 2] != b"\x00\x00":
+        return None
+    text = "".join(chars)
+    if not text_quality_ok(text):
+        return None
+    return text, pos + 2
+
+
+def parse_dbdat_metadata_blob_at(data: bytes, offset: int, max_strings: int = 6) -> dict[str, object] | None:
+    if offset < 0 or offset >= len(data):
+        return None
+    if offset >= 2 and data[offset - 2:offset] != b"\x00\x00":
+        return None
+    strings: list[str] = []
+    pos = offset
+    while len(strings) < max_strings:
+        decoded = decode_utf16be_string_at(data, pos)
+        if decoded is None:
+            break
+        text, next_pos = decoded
+        strings.append(text)
+        pos = next_pos
+    if len(strings) < 4:
+        return None
+    if any(len(text) < 2 for text in strings[:4]):
+        return None
+    if not all(all(is_latinish_char(ch) for ch in text) for text in strings[:4]):
+        return None
+    if strings[0][0].isalpha() and strings[0][0].islower():
+        return None
+    blob = {
+        "offset": offset,
+        "offset_hex": f"0x{offset:06x}",
+        "strings": strings,
+        "artist": strings[0] if len(strings) > 0 else None,
+        "album": strings[1] if len(strings) > 1 else None,
+        "genre": strings[2] if len(strings) > 2 else None,
+        "title": strings[3] if len(strings) > 3 else None,
+        "end_offset": pos,
+        "trailer_preview_hex": data[pos:min(len(data), pos + 16)].hex(" "),
+    }
+    return blob
+
+
+def observed_compact_slot_tag(block: bytes, raw_offset: int) -> int | None:
+    if raw_offset < 4:
+        return None
+    value = struct.unpack_from(">I", block, raw_offset - 4)[0]
+    if value > 0x20:
+        return None
+    return value
+
+
+def observed_compact_slot_prefix_char(raw_text: str, trimmed_text: str) -> str | None:
+    if not raw_text:
+        return None
+    if raw_text == trimmed_text:
+        return None
+    trimmed_index = raw_text.find(trimmed_text)
+    if trimmed_index <= 0:
+        return raw_text[0]
+    return raw_text[:trimmed_index]
+
+
+def parse_observed_compact_idx_page(
+    db_idx: bytes,
+    page_index: int,
+    dat_record_by_start: dict[int, DatRecord],
+    field_map: dict[int, str],
+    metadata_blobs: dict[int, dict[str, object]] | None = None,
+    db_dat_size: int | None = None,
+    max_slots: int = 24,
+    max_tail_cells: int = 24,
+) -> dict[str, object]:
+    metadata_blobs = metadata_blobs or {}
+    page_offset = page_index * IDX_PAGE_SIZE
+    block = db_idx[page_offset:page_offset + IDX_PAGE_SIZE]
+    if len(block) < IDX_PAGE_SIZE:
+        raise ValueError(f"page {page_index} is out of range")
+
+    raw_hits = extract_utf16_strings(
+        block,
+        min_chars=4,
+        byteorder="big",
+        offset_step=1,
+        normalize_leading_noise=False,
+    )
+    slots: list[dict[str, object]] = []
+    candidate_blob_refs: set[int] = set()
+
+    candidate_hits = []
+    for hit in raw_hits:
+        trimmed_offset, trimmed_text = trim_leading_noise(hit.text, hit.offset)
+        if not trimmed_text:
+            continue
+        tag_value = observed_compact_slot_tag(block, hit.offset)
+        prefix = observed_compact_slot_prefix_char(hit.text, trimmed_text)
+        if tag_value is None and prefix is None:
+            continue
+        candidate_hits.append(
+            {
+                "raw_offset": hit.offset,
+                "raw_text": hit.text,
+                "trimmed_offset": trimmed_offset,
+                "trimmed_text": trimmed_text,
+                "tag_value": tag_value,
+                "prefix": prefix,
+            }
+        )
+
+    for index, hit in enumerate(candidate_hits[:max_slots]):
+        raw_text = hit["raw_text"]
+        raw_text_bytes = raw_text.encode("utf-16be") + b"\x00\x00"
+        text_end = hit["raw_offset"] + len(raw_text_bytes)
+        if index + 1 < len(candidate_hits):
+            next_hit = candidate_hits[index + 1]
+            next_start = next_hit["raw_offset"] - 4 if next_hit["tag_value"] is not None else next_hit["raw_offset"]
+        else:
+            next_start = len(block)
+        next_start = max(text_end, min(len(block), next_start))
+        tail = block[text_end:next_start]
+        tail_cells = []
+        for tail_index in range(0, min(len(tail), max_tail_cells * 4), 4):
+            cell = tail[tail_index:tail_index + 4]
+            if len(cell) < 4:
+                break
+            be32 = int.from_bytes(cell, "big")
+            ref24 = int.from_bytes(cell[:3], "big")
+            annotation_kind = "literal"
+            annotation = None
+            if be32 in field_map:
+                annotation_kind = "field_u32"
+                annotation = f"field:{field_map[be32]}"
+            elif be32 in metadata_blobs:
+                blob = metadata_blobs[be32]
+                annotation_kind = "metadata_blob_u32"
+                annotation = (
+                    f"metadata:{blob['artist']} / {blob['album']} / {blob['title']}"
+                )
+            elif be32 in dat_record_by_start:
+                annotation_kind = "dat_u32"
+                annotation = f"dat:{dat_record_by_start[be32].text}"
+            elif be32 == 0:
+                annotation_kind = "zero_u32"
+                annotation = "zero"
+            elif ref24 in dat_record_by_start:
+                annotation_kind = "dat_24"
+                annotation = f"dat:{dat_record_by_start[ref24].text}"
+            elif 0 < be32 < len(db_idx):
+                annotation_kind = "idx_u32"
+                annotation = f"idx:0x{be32:08x}"
+            elif 0 < ref24 < 0x100000:
+                annotation_kind = "raw_24"
+                annotation = f"raw24:0x{ref24:06x}"
+            if db_dat_size is not None and 0 < be32 < db_dat_size:
+                candidate_blob_refs.add(be32)
+            tail_cells.append(
+                {
+                    "tail_offset": page_offset + text_end + tail_index,
+                    "u32_hex": f"0x{be32:08x}",
+                    "ref24_hex": f"0x{ref24:06x}",
+                    "suffix_byte": cell[3],
+                    "annotation_kind": annotation_kind,
+                    "annotation": annotation,
+                }
+            )
+            if annotation_kind == "metadata_blob_24":
+                candidate_blob_refs.add(ref24)
+
+        slots.append(
+            {
+                "raw_offset": page_offset + hit["raw_offset"],
+                "trimmed_offset": page_offset + hit["trimmed_offset"],
+                "tag_value": hit["tag_value"],
+                "prefix_text": hit["prefix"],
+                "text": hit["trimmed_text"],
+                "text_class": classify_payload_text(hit["trimmed_text"]),
+                "tail_cell_count": len(tail_cells),
+                "tail_cells": tail_cells,
+                "metadata_blob_ref_count": sum(1 for cell in tail_cells if cell["annotation_kind"] == "metadata_blob_u32"),
+                "dat_ref_count": sum(1 for cell in tail_cells if cell["annotation_kind"] in {"dat_u32", "dat_24"}),
+                "field_ref_count": sum(1 for cell in tail_cells if cell["annotation_kind"] == "field_u32"),
+            }
+        )
+
+    return {
+        "page_index": page_index,
+        "offset": page_offset,
+        "slot_count": len(slots),
+        "candidate_metadata_blob_ref_count": len(candidate_blob_refs),
+        "candidate_metadata_blob_refs": [f"0x{value:08x}" for value in sorted(candidate_blob_refs)],
+        "slots": slots,
+    }
+
+
+def compact_slot_template_signature(slot: dict[str, object]) -> tuple[object, ...]:
+    return (
+        slot["tag_value"],
+        slot["text_class"],
+        tuple(
+            cell["annotation_kind"]
+            for cell in slot["tail_cells"][:6]
+        ),
+    )
+
+
+def compact_page_template_signature(page: dict[str, object]) -> tuple[tuple[object, ...], ...]:
+    return tuple(compact_slot_template_signature(slot) for slot in page["slots"][:10])
+
+
+def build_observed_compact_idx_template_library(
+    db_idx: bytes,
+    db_dic: bytes,
+    db_dat: bytes,
+) -> dict[str, object]:
+    dic_fields = parse_db_dic(db_dic)
+    dat_records = collect_dat_records(db_dat)
+    dat_record_by_start = {record.record_start: record for record in dat_records}
+    field_map = {field.entry_offset: field.name for field in dic_fields}
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+
+    raw_pages: list[dict[str, object]] = []
+    candidate_blob_offsets: dict[int, int] = {}
+    for page_index in range(page_count):
+        parsed = parse_observed_compact_idx_page(
+            db_idx,
+            page_index,
+            dat_record_by_start,
+            field_map,
+            metadata_blobs={},
+            db_dat_size=len(db_dat),
+        )
+        if parsed["slot_count"] < 2:
+            continue
+        raw_pages.append(parsed)
+        for ref_hex in parsed["candidate_metadata_blob_refs"]:
+            ref24 = int(ref_hex, 16)
+            candidate_blob_offsets[ref24] = candidate_blob_offsets.get(ref24, 0) + 1
+
+    metadata_blobs: dict[int, dict[str, object]] = {}
+    for offset, ref_count in sorted(candidate_blob_offsets.items()):
+        blob = parse_dbdat_metadata_blob_at(db_dat, offset)
+        if blob is None:
+            continue
+        blob["ref_count"] = ref_count
+        metadata_blobs[offset] = blob
+
+    variants_by_signature: dict[tuple[tuple[object, ...], ...], dict[str, object]] = {}
+    for page in raw_pages:
+        annotated = parse_observed_compact_idx_page(
+            db_idx,
+            page["page_index"],
+            dat_record_by_start,
+            field_map,
+            metadata_blobs=metadata_blobs,
+            db_dat_size=len(db_dat),
+        )
+        useful_slots = [
+            slot
+            for slot in annotated["slots"]
+            if slot["metadata_blob_ref_count"] or slot["dat_ref_count"] or slot["field_ref_count"]
+        ]
+        if len(useful_slots) < 2:
+            continue
+        signature = compact_page_template_signature(annotated)
+        candidate = variants_by_signature.get(signature)
+        template = {
+            "source_page_index": annotated["page_index"],
+            "slot_count": annotated["slot_count"],
+            "slot_templates": [
+                {
+                    "tag_value": slot["tag_value"],
+                    "text_class": slot["text_class"],
+                    "metadata_blob_ref_count": slot["metadata_blob_ref_count"],
+                    "dat_ref_count": slot["dat_ref_count"],
+                    "field_ref_count": slot["field_ref_count"],
+                    "example_text": slot["text"],
+                }
+                for slot in annotated["slots"][:10]
+            ],
+        }
+        if candidate is None:
+            variants_by_signature[signature] = {
+                "template": template,
+                "count": 1,
+                "score": (
+                    sum(slot["metadata_blob_ref_count"] for slot in useful_slots),
+                    len(useful_slots),
+                    annotated["slot_count"],
+                ),
+                "example_page": {
+                    "page_index": annotated["page_index"],
+                    "slot_count": annotated["slot_count"],
+                    "texts": [slot["text"] for slot in annotated["slots"][:8]],
+                },
+            }
+        else:
+            candidate["count"] += 1
+
+    ordered_variants = sorted(
+        variants_by_signature.values(),
+        key=lambda item: (item["score"], item["count"]),
+        reverse=True,
+    )
+    family_summaries = [
+        {
+            "page_family": "compact_metadata_page",
+            "variant_count": len(ordered_variants),
+            "selected_template": ordered_variants[0]["template"] if ordered_variants else None,
+            "variants": [
+                {
+                    "count": item["count"],
+                    "score": list(item["score"]),
+                    "example_page": item["example_page"],
+                    "template": item["template"],
+                }
+                for item in ordered_variants[:8]
+            ],
+        }
+    ] if ordered_variants else []
+
+    metadata_blob_summaries = [
+        {
+            "offset": blob["offset"],
+            "offset_hex": blob["offset_hex"],
+            "ref_count": blob["ref_count"],
+            "artist": blob["artist"],
+            "album": blob["album"],
+            "genre": blob["genre"],
+            "title": blob["title"],
+        }
+        for blob in sorted(
+            metadata_blobs.values(),
+            key=lambda item: (-int(item["ref_count"]), item["offset"]),
+        )[:64]
+    ]
+
+    selected_templates = {
+        "compact_metadata_page": ordered_variants[0]["template"]
+        for _ in [0]
+        if ordered_variants
+    }
+
+    return {
+        "page_count": page_count,
+        "family_count": len(family_summaries),
+        "selected_templates": selected_templates,
+        "family_summaries": family_summaries,
+        "metadata_blob_count": len(metadata_blobs),
+        "metadata_blob_by_offset": metadata_blobs,
+        "metadata_blobs": metadata_blob_summaries,
+    }
 
 
 def render_dat_tree_node(
@@ -999,6 +1658,7 @@ def load_source_inventory(media_dir: Path, inventory_path: Path | None = None) -
             SourceMediaEntry(
                 path=str(path),
                 relative_path=relative_path,
+                target_base_dir="",
                 file_name=path.name,
                 title=item.get("title"),
                 artist=item.get("artist"),
@@ -1030,8 +1690,12 @@ def load_source_entries_from_dirs(
         dir_entries = load_source_inventory(media_dir, inventory_path=inventory_path)
         try:
             relative_media_dir = media_dir.relative_to(root).as_posix()
+            if relative_media_dir in {"", "."}:
+                relative_media_dir = media_dir.name
         except ValueError:
-            relative_media_dir = media_dir.name
+            relative_media_dir = f"Music/{media_dir.name}"
+        for entry in dir_entries:
+            entry.target_base_dir = relative_media_dir
         manifests.append(
             {
                 "media_dir": str(media_dir),
@@ -1076,11 +1740,11 @@ def build_rebuild_plan_data(
     exact_path_collisions = []
     name_collisions = []
     for entry in source_entries:
-        absolute_path = Path(entry.path).resolve()
-        try:
-            target_path = absolute_path.relative_to(root).as_posix()
-        except ValueError:
-            target_path = entry.relative_path
+        target_path = "/".join(
+            part.strip("/")
+            for part in [entry.target_base_dir, entry.relative_path]
+            if part and part not in {"", "."}
+        )
         same_path = canonical_by_path.get(target_path, [])
         same_name = canonical_by_name.get(entry.file_name, [])
         if same_path:
@@ -1121,9 +1785,10 @@ def build_rebuild_plan_data(
 def build_target_library_entries(
     canonical_entries: list[NormalizedMediaEntry],
     planned_additions: list[dict[str, object]],
+    existing_object_id_floor: int = 0,
 ) -> list[TargetLibraryEntry]:
     entries: list[TargetLibraryEntry] = []
-    max_object_id = max((entry.object_id for entry in canonical_entries), default=0)
+    max_object_id = max(existing_object_id_floor, max((entry.object_id for entry in canonical_entries), default=0))
     next_object_id = max_object_id + 1
 
     for entry in canonical_entries:
@@ -1147,6 +1812,28 @@ def build_target_library_entries(
             )
         )
 
+    def infer_planned_artist(target_path: str, source: dict[str, object]) -> str | None:
+        path_parts = {part.lower() for part in Path(target_path).parts}
+        if "podcast" in path_parts:
+            return "Podcast"
+        artist = source.get("artist")
+        if artist:
+            return normalize_display_text(artist)
+        album = source.get("album")
+        if album:
+            return normalize_display_text(album)
+        parent_name = Path(target_path).parent.name
+        return normalize_display_text(parent_name) or None
+
+    def infer_planned_genre(target_path: str, source: dict[str, object]) -> str | None:
+        genre = source.get("genre")
+        if genre:
+            return normalize_display_text(genre)
+        path_parts = {part.lower() for part in Path(target_path).parts}
+        if "podcast" in path_parts:
+            return "Podcast"
+        return None
+
     for item in planned_additions:
         source = item["source"]
         entries.append(
@@ -1154,10 +1841,10 @@ def build_target_library_entries(
                 source_kind="planned_addition",
                 target_path=item["target_path"],
                 file_name=source["file_name"],
-                title=source.get("title"),
-                artist=source.get("artist"),
-                album=source.get("album"),
-                genre=source.get("genre"),
+                title=normalize_display_text(source.get("title")) or normalize_display_text(Path(source["file_name"]).stem),
+                artist=infer_planned_artist(item["target_path"], source),
+                album=normalize_display_text(source.get("album")),
+                genre=infer_planned_genre(item["target_path"], source),
                 track_number=source.get("track_number"),
                 year=source.get("year"),
                 size=source.get("size"),
@@ -1174,18 +1861,92 @@ def build_target_library_entries(
     return entries
 
 
-def build_existing_folder_entries(db_dat: bytes) -> dict[str, DatRecord]:
-    records = validated_folder_file_records(db_dat)
-    records_by_id = {record.object_id: record for record in records}
-    folder_map: dict[str, DatRecord] = {}
+def max_preserved_object_id(root: Path) -> int:
+    db_dat = find_db_files(root)["db.dat"].read_bytes()
+    return max(
+        (
+            record.object_id
+            for record in collect_preserved_dbdat_records(db_dat)
+            if 0 < record.object_id < 0xFFFFFFFF
+        ),
+        default=0,
+    )
+
+
+def build_existing_path_entry_map(db_dat: bytes, allowed_kinds: set[int]) -> dict[str, DatRecord]:
+    records = [record for record in collect_dat_records(db_dat) if record.kind in allowed_kinds]
+    records_by_id = {
+        record.object_id: record
+        for record in records
+        if 0 < record.object_id < 0xFFFFFFFF
+    }
+    path_map: dict[str, DatRecord] = {}
     for record in records:
-        if record.kind != 0x100:
-            continue
         _ancestor_ids, _ancestor_names, inferred_path = infer_record_path(record, records_by_id)
-        existing = folder_map.get(inferred_path)
+        existing = path_map.get(inferred_path)
         if existing is None or record.record_start < existing.record_start:
-            folder_map[inferred_path] = record
-    return folder_map
+            path_map[inferred_path] = record
+    return path_map
+
+
+def build_existing_folder_entries(db_dat: bytes) -> dict[str, DatRecord]:
+    return build_existing_path_entry_map(db_dat, {0x100})
+
+
+def build_existing_playlist_entries(db_dat: bytes) -> dict[str, DatRecord]:
+    return build_existing_path_entry_map(db_dat, {0x400})
+
+
+def build_existing_special_root_entries(db_dat: bytes) -> dict[str, DatRecord]:
+    path_map: dict[str, DatRecord] = {}
+    for record in collect_dat_records(db_dat):
+        if record.kind != 0x0:
+            continue
+        if not (record.text.startswith("/") and record.text.endswith("/")):
+            continue
+        existing = path_map.get(record.text)
+        if existing is None or record.record_start < existing.record_start:
+            path_map[record.text] = record
+    return path_map
+
+
+def collect_preserved_dbdat_records(db_dat: bytes) -> list[TargetDatRecord]:
+    preserved = [
+        record
+        for record in collect_dat_records(db_dat)
+        if record.kind in {0x100, 0x200, 0x400} or (record.kind == 0x0 and record.text == "/a/")
+    ]
+    records_by_id = {
+        record.object_id: record
+        for record in preserved
+        if 0 < record.object_id < 0xFFFFFFFF
+    }
+    target_records: list[TargetDatRecord] = []
+    for record in preserved:
+        _ancestor_ids, _ancestor_names, inferred_path = infer_record_path(record, records_by_id)
+        target_records.append(
+            TargetDatRecord(
+                record_start=record.record_start,
+                object_id=record.object_id,
+                parent_id=record.parent_id,
+                kind=record.kind,
+                text=record.text,
+                target_path=inferred_path,
+            )
+        )
+    return target_records
+
+
+def folder_paths_for_entries(entries: list[TargetLibraryEntry]) -> set[str]:
+    folder_path_set: set[str] = set()
+    for entry in entries:
+        parent = str(Path(entry.target_path).parent).replace("\\", "/")
+        if parent in {"", "."}:
+            continue
+        parts = Path(parent).parts
+        for index in range(1, len(parts) + 1):
+            folder_path_set.add("/".join(parts[:index]))
+    return folder_path_set
 
 
 def target_entry_object_id(entry: TargetLibraryEntry) -> int:
@@ -1196,8 +1957,117 @@ def target_entry_object_id(entry: TargetLibraryEntry) -> int:
     raise ValueError(f"Target entry has no object id: {entry.target_path}")
 
 
+def align_up(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return value
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def serialize_dat_record_bytes(object_id: int, parent_id: int, kind: int, text: str) -> bytes:
-    return struct.pack(">III", object_id, parent_id & 0xFFFFFFFF, kind) + text.encode("utf-16le") + b"\x00\x00"
+    return (
+        struct.pack(">III", object_id, parent_id & 0xFFFFFFFF, kind)
+        + text.encode("utf-16le")
+        + b"\x00\x00"
+        + (b"\x00" * DB_DAT_RECORD_PADDING_BYTES)
+    )
+
+
+def dbdat_prefix_bytes(db_dat: bytes) -> bytes:
+    return db_dat[:DB_DAT_PREFIX_BYTES]
+
+
+def metadata_blob_strings_for_entry(entry: TargetLibraryEntry) -> tuple[str, str, str, str]:
+    title = target_title_for_idx(entry) or normalize_display_text(Path(entry.file_name).stem) or "Unknown Title"
+    artist = normalize_display_text(entry.artist) or normalize_display_text(entry.album) or "Unknown Artist"
+    album = normalize_display_text(entry.album) or normalize_display_text(Path(entry.target_path).parent.name) or "Unknown Album"
+    genre = normalize_display_text(entry.genre) or "Unknown"
+    return artist, album, genre, title
+
+
+def serialize_metadata_blob_bytes(artist: str, album: str, genre: str, title: str) -> bytes:
+    blob = b"".join(
+        pack_utf16be_null_terminated(text)
+        for text in [artist, album, genre, title]
+    )
+    blob += b"\x00" * 16
+    blob += b"\x00" * ((4 - (len(blob) % 4)) % 4)
+    return blob
+
+
+def build_dbdat_metadata_blobs(
+    root: Path,
+    target_library: list[TargetLibraryEntry],
+    records: list[TargetDatRecord],
+) -> list[TargetMetadataBlob]:
+    original_dbdat = find_db_files(root)["db.dat"].read_bytes()
+    layout_bytes = serialize_dbdat_prototype(records, base_bytes=original_dbdat)
+    start_offset = align_up(
+        max(
+            (
+                record.record_start + len(serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text))
+                for record in records
+            ),
+            default=0,
+        ),
+        4,
+    )
+    free_spans = [list(span) for span in dbdat_zero_spans(layout_bytes, start_offset=start_offset, min_size=4)]
+    if not free_spans:
+        return []
+
+    record_by_target_path = {
+        record.target_path: record
+        for record in records
+        if record.kind == 0x200
+    }
+    metadata_blobs: list[TargetMetadataBlob] = []
+    for entry in sorted((item for item in target_library if item.source_kind == "planned_addition"), key=lambda item: item.target_path.lower()):
+        record = record_by_target_path.get(entry.target_path)
+        if record is None:
+            continue
+        artist, album, genre, title = metadata_blob_strings_for_entry(entry)
+        blob_bytes = serialize_metadata_blob_bytes(artist, album, genre, title)
+        allocated_offset: int | None = None
+        for span in free_spans:
+            aligned_start = align_up(span[0], 4)
+            if span[1] - aligned_start >= len(blob_bytes):
+                allocated_offset = aligned_start
+                span[0] = aligned_start + len(blob_bytes)
+                break
+        if allocated_offset is None:
+            raise ValueError(f"db.dat has no free aligned span large enough for metadata blob: {entry.target_path}")
+        metadata_blobs.append(
+            TargetMetadataBlob(
+                offset=allocated_offset,
+                target_path=entry.target_path,
+                artist=artist,
+                album=album,
+                genre=genre,
+                title=title,
+            )
+        )
+    return metadata_blobs
+
+
+def dbdat_zero_spans(
+    db_dat: bytes,
+    *,
+    start_offset: int = 0,
+    min_size: int = 1,
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    span_start: int | None = None
+    for offset in range(max(0, start_offset), len(db_dat)):
+        if db_dat[offset] == 0:
+            if span_start is None:
+                span_start = offset
+        elif span_start is not None:
+            if offset - span_start >= min_size:
+                spans.append((span_start, offset))
+            span_start = None
+    if span_start is not None and len(db_dat) - span_start >= min_size:
+        spans.append((span_start, len(db_dat)))
+    return spans
 
 
 def build_dbdat_prototype_records(
@@ -1205,19 +2075,18 @@ def build_dbdat_prototype_records(
     target_library: list[TargetLibraryEntry],
 ) -> list[TargetDatRecord]:
     db_dat = find_db_files(root)["db.dat"].read_bytes()
-    existing_folder_map = build_existing_folder_entries(db_dat)
-    max_existing_folder_id = max((record.object_id for record in existing_folder_map.values()), default=0)
+    preserved_records = collect_preserved_dbdat_records(db_dat)
+    existing_folder_map = {
+        record.target_path: record
+        for record in preserved_records
+        if record.kind == 0x100
+    }
+    max_existing_folder_id = max((record.object_id for record in preserved_records if 0 < record.object_id < 0xFFFFFFFF), default=0)
     max_existing_target_id = max((target_entry_object_id(entry) for entry in target_library), default=0)
     next_object_id = max(max_existing_folder_id, max_existing_target_id) + 1
 
-    folder_path_set: set[str] = set()
-    for entry in target_library:
-        parent = str(Path(entry.target_path).parent).replace("\\", "/")
-        if parent in {"", "."}:
-            continue
-        parts = Path(parent).parts
-        for index in range(1, len(parts) + 1):
-            folder_path_set.add("/".join(parts[:index]))
+    planned_entries = [entry for entry in target_library if entry.source_kind == "planned_addition"]
+    folder_path_set = folder_paths_for_entries(planned_entries)
 
     folder_paths = sorted(folder_path_set, key=lambda path: (path.count("/"), path.lower()))
 
@@ -1228,6 +2097,11 @@ def build_dbdat_prototype_records(
         else:
             folder_ids[folder_path] = next_object_id
             next_object_id += 1
+    new_folder_paths = {
+        folder_path
+        for folder_path in folder_paths
+        if folder_path not in existing_folder_map
+    }
 
     folders_by_parent: dict[str, list[str]] = {}
     files_by_parent: dict[str, list[TargetLibraryEntry]] = {}
@@ -1236,7 +2110,7 @@ def build_dbdat_prototype_records(
         if parent == ".":
             parent = ""
         folders_by_parent.setdefault(parent, []).append(folder_path)
-    for entry in target_library:
+    for entry in planned_entries:
         parent = str(Path(entry.target_path).parent).replace("\\", "/")
         if parent == ".":
             parent = ""
@@ -1247,14 +2121,57 @@ def build_dbdat_prototype_records(
     for entries in files_by_parent.values():
         entries.sort(key=lambda entry: entry.target_path.lower())
 
-    records: list[TargetDatRecord] = []
-    offset = 0
+    records = list(preserved_records)
+    reserved_end = max(
+        (record.record_start + len(serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text)) for record in records),
+        default=len(dbdat_prefix_bytes(db_dat)),
+    )
+    pending_specs: list[tuple[int, int, int, str, str]] = []
 
-    def append_record(object_id: int, parent_id: int, kind: int, text: str, target_path: str) -> None:
-        nonlocal offset
+    def append_record_spec(object_id: int, parent_id: int, kind: int, text: str, target_path: str) -> None:
+        pending_specs.append((object_id, parent_id, kind, text, target_path))
+
+    def emit_folder_header(folder_path: str) -> None:
+        if folder_path in new_folder_paths:
+            folder_name = Path(folder_path).name + "/"
+            parent_path = str(Path(folder_path).parent).replace("\\", "/")
+            if parent_path == ".":
+                parent_path = ""
+            parent_id = 0xFFFFFFFF if folder_path == "Music" else folder_ids.get(parent_path, 0)
+            append_record_spec(folder_ids[folder_path], parent_id, 0x100, folder_name, folder_path)
+        for entry in files_by_parent.get(folder_path, []):
+            append_record_spec(target_entry_object_id(entry), folder_ids[folder_path], 0x200, entry.file_name, entry.target_path)
+
+    def emit_folder(folder_path: str) -> None:
+        emit_folder_header(folder_path)
+        for child_folder in folders_by_parent.get(folder_path, []):
+            emit_folder(child_folder)
+
+    for folder_path in folders_by_parent.get("", []):
+        emit_folder(folder_path)
+
+    if not pending_specs:
+        return records
+
+    free_spans = [list(span) for span in dbdat_zero_spans(db_dat, start_offset=reserved_end, min_size=1)]
+    if not free_spans:
+        raise ValueError("db.dat has no zero-filled free spans available for planned additions")
+
+    for object_id, parent_id, kind, text, target_path in pending_specs:
+        record_bytes = serialize_dat_record_bytes(object_id, parent_id, kind, text)
+        record_size = len(record_bytes)
+        allocated_offset: int | None = None
+        for span in free_spans:
+            span_start, span_end = span
+            if span_end - span_start >= record_size:
+                allocated_offset = span_start
+                span[0] = span_start + record_size
+                break
+        if allocated_offset is None:
+            raise ValueError(f"db.dat has no free zero span large enough for {target_path} ({record_size} bytes)")
         records.append(
             TargetDatRecord(
-                record_start=offset,
+                record_start=allocated_offset,
                 object_id=object_id,
                 parent_id=parent_id,
                 kind=kind,
@@ -1262,33 +2179,60 @@ def build_dbdat_prototype_records(
                 target_path=target_path,
             )
         )
-        offset += len(serialize_dat_record_bytes(object_id, parent_id, kind, text))
 
-    def emit_folder(folder_path: str) -> None:
-        folder_name = Path(folder_path).name + "/"
-        parent_path = str(Path(folder_path).parent).replace("\\", "/")
-        if parent_path == ".":
-            parent_path = ""
-        parent_id = 0xFFFFFFFF if folder_path == "Music" else folder_ids.get(parent_path, 0)
-        append_record(folder_ids[folder_path], parent_id, 0x100, folder_name, folder_path)
-        for entry in files_by_parent.get(folder_path, []):
-            append_record(target_entry_object_id(entry), folder_ids[folder_path], 0x200, entry.file_name, entry.target_path)
-        for child_folder in folders_by_parent.get(folder_path, []):
-            emit_folder(child_folder)
-
-    for entry in files_by_parent.get("", []):
-        append_record(target_entry_object_id(entry), 0, 0x200, entry.file_name, entry.target_path)
-    for folder_path in folders_by_parent.get("", []):
-        emit_folder(folder_path)
-
+    records.sort(key=lambda record: record.record_start)
     return records
 
 
-def serialize_dbdat_prototype(records: list[TargetDatRecord]) -> bytes:
-    return b"".join(
-        serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text)
-        for record in records
-    )
+def select_idx_extension_dbdat_records(
+    all_records: list[TargetDatRecord],
+    planned_entries: list[TargetLibraryEntry],
+) -> list[TargetDatRecord]:
+    planned_paths = {entry.target_path for entry in planned_entries}
+    folder_paths = folder_paths_for_entries(planned_entries)
+    return [
+        record
+        for record in all_records
+        if record.target_path in planned_paths or record.target_path in folder_paths
+    ]
+
+
+def serialize_dbdat_prototype(
+    records: list[TargetDatRecord],
+    prefix: bytes = b"",
+    base_bytes: bytes | None = None,
+    metadata_blobs: list[TargetMetadataBlob] | None = None,
+) -> bytes:
+    metadata_blobs = metadata_blobs or []
+    if base_bytes is None:
+        out = prefix + b"".join(
+            serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text)
+            for record in records
+        )
+        if not metadata_blobs:
+            return out
+        blob_tail = bytearray(out)
+        for blob in metadata_blobs:
+            blob_bytes = serialize_metadata_blob_bytes(blob.artist, blob.album, blob.genre, blob.title)
+            end = blob.offset + len(blob_bytes)
+            if end > len(blob_tail):
+                blob_tail.extend(b"\x00" * (end - len(blob_tail)))
+            blob_tail[blob.offset:end] = blob_bytes
+        return bytes(blob_tail)
+    out = bytearray(base_bytes)
+    for record in records:
+        record_bytes = serialize_dat_record_bytes(record.object_id, record.parent_id, record.kind, record.text)
+        end = record.record_start + len(record_bytes)
+        if end > len(out):
+            out.extend(b"\x00" * (end - len(out)))
+        out[record.record_start:end] = record_bytes
+    for blob in metadata_blobs:
+        blob_bytes = serialize_metadata_blob_bytes(blob.artist, blob.album, blob.genre, blob.title)
+        end = blob.offset + len(blob_bytes)
+        if end > len(out):
+            out.extend(b"\x00" * (end - len(out)))
+        out[blob.offset:end] = blob_bytes
+    return bytes(out)
 
 
 def target_title_for_idx(entry: TargetLibraryEntry) -> str:
@@ -1315,11 +2259,538 @@ def pad_bytes_to_length(data: bytes, target_length: int, label: str) -> bytes:
     return data + (b"\x00" * (target_length - len(data)))
 
 
+def idx_text_values_for_record(record: TargetDatRecord) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if record.kind == 0x0:
+        values["RMusic"] = record.text
+    elif record.kind == 0x100:
+        values["FilePath"] = clean_folder_name(record.text) + "/"
+    elif record.kind in {0x200, 0x400}:
+        values["FileName"] = record.text
+    return values
+
+
+def idx_text_values_for_entry(entry: TargetLibraryEntry) -> dict[str, str]:
+    values = {"FileName": entry.file_name}
+    title_text = target_title_for_idx(entry)
+    if title_text:
+        values["Title"] = title_text
+    if entry.artist:
+        values["Artist"] = entry.artist
+    if entry.album:
+        values["Album"] = entry.album
+    if entry.genre:
+        values["Genre"] = entry.genre
+    return values
+
+
+def idx_numeric_values_for_entry(entry: TargetLibraryEntry) -> dict[str, int]:
+    values: dict[str, int] = {}
+    duration_ms = int((entry.duration_seconds or 0) * 1000)
+    if duration_ms:
+        values["Duration"] = duration_ms
+    if entry.bit_rate_bps:
+        values["BitRate"] = entry.bit_rate_bps
+    if entry.sample_rate_hz:
+        values["SampleRate"] = entry.sample_rate_hz
+    return values
+
+
+def instantiate_observed_chain_template(
+    template: ObservedIdxChainTemplate | None,
+    *,
+    field_offsets: dict[str, int],
+    text_values: dict[str, str],
+    numeric_values: dict[str, int] | None = None,
+) -> list[dict[str, object]]:
+    if template is None:
+        return []
+    numeric_values = numeric_values or {}
+    nodes: list[dict[str, object]] = []
+    for node_template in template.node_templates:
+        field_name = node_template.field_name or node_template.payload_role
+        field_entry_offset = field_offsets.get(field_name, 0) if field_name else 0
+        if node_template.payload_kind == "empty":
+            nodes.append(
+                {
+                    "field_name": field_name or "",
+                    "field_entry_offset": field_entry_offset,
+                    "value": node_template.literal_value or 0,
+                    "node_type": node_template.node_type,
+                    "payload": b"",
+                    "payload_text": "",
+                }
+            )
+            continue
+        if node_template.payload_kind == "text":
+            payload_role = node_template.payload_role or field_name
+            if not payload_role:
+                continue
+            text = text_values.get(payload_role)
+            if not text:
+                continue
+            value = 0 if node_template.value_mode == "zero" else stable_idx_text_value(text)
+            nodes.append(
+                {
+                    "field_name": field_name or "",
+                    "field_entry_offset": field_entry_offset,
+                    "value": value,
+                    "node_type": node_template.node_type,
+                    "payload": pack_utf16be_null_terminated(text),
+                    "payload_text": text,
+                }
+            )
+            continue
+        if node_template.payload_kind == "numeric":
+            payload_role = node_template.payload_role or field_name
+            if not payload_role:
+                continue
+            value = numeric_values.get(payload_role)
+            if not value:
+                continue
+            nodes.append(
+                {
+                    "field_name": field_name or "",
+                    "field_entry_offset": field_entry_offset,
+                    "value": value,
+                    "node_type": node_template.node_type,
+                    "payload": b"",
+                    "payload_text": "",
+                }
+            )
+    return nodes
+
+
+def compact_slot_recipe_from_observed_slot(
+    slot: dict[str, object],
+    slots: list[dict[str, object]],
+    page_offset: int,
+    source_slot_index: int,
+    *,
+    fallback_tag_value: int = 0,
+) -> dict[str, object]:
+    tail_cells: list[dict[str, object]] = []
+    for cell in slot["tail_cells"]:
+        source_u32 = int(cell["u32_hex"], 16)
+        page_local_target_slot_delta = None
+        page_local_target_offset = None
+        if cell["annotation_kind"] == "idx_u32" and page_offset <= source_u32 < page_offset + IDX_PAGE_SIZE:
+            for target_slot_index, target_slot in enumerate(slots):
+                target_start = target_slot["raw_offset"]
+                if target_slot_index + 1 < len(slots):
+                    target_end = slots[target_slot_index + 1]["raw_offset"]
+                else:
+                    target_end = page_offset + IDX_PAGE_SIZE
+                if target_start <= source_u32 < target_end:
+                    page_local_target_slot_delta = target_slot_index - source_slot_index
+                    page_local_target_offset = source_u32 - target_start
+                    break
+        tail_cells.append(
+            {
+                "annotation_kind": cell["annotation_kind"],
+                "source_u32": source_u32,
+                "page_local_target_slot_delta": page_local_target_slot_delta,
+                "page_local_target_offset": page_local_target_offset,
+            }
+        )
+    return {
+        "tag_value": slot["tag_value"] if slot["tag_value"] is not None else fallback_tag_value,
+        "tail_cells": tail_cells,
+        "tail_cell_count": len(tail_cells),
+        "source_slot_index": source_slot_index,
+        "source_text": slot["text"],
+    }
+
+
+def compact_slot_bytes(
+    text: str,
+    tail_values: list[int],
+    *,
+    tag_value: int = 0,
+) -> bytes:
+    return (
+        struct.pack(">I", tag_value & 0xFFFFFFFF)
+        + pack_utf16be_null_terminated(text)
+        + b"".join(struct.pack(">I", value & 0xFFFFFFFF) for value in tail_values)
+    )
+
+
+def compact_recipe_from_annotation_kinds(
+    annotation_kinds: list[str],
+    *,
+    tag_value: int,
+) -> dict[str, object]:
+    return {
+        "tag_value": tag_value,
+        "tail_cells": [
+            {
+                "annotation_kind": annotation_kind,
+                "source_u32": 0,
+                "page_local_target_slot_delta": None,
+                "page_local_target_offset": None,
+            }
+            for annotation_kind in annotation_kinds
+        ],
+        "tail_cell_count": len(annotation_kinds),
+        "source_slot_index": None,
+        "source_text": "",
+    }
+
+
+def compact_recipe_block_score(slots: list[dict[str, object]], start_index: int) -> int | None:
+    if start_index + 5 > len(slots):
+        return None
+    block = slots[start_index:start_index + 5]
+    audio_slot = block[0]
+    if audio_slot["text_class"] != "audio_file" or audio_slot["dat_ref_count"] == 0:
+        return None
+    metadata_slots = block[1:]
+    if any(slot["text_class"] != "metadata" or slot["metadata_blob_ref_count"] == 0 for slot in metadata_slots):
+        return None
+    score = 100
+    score += sum(min(slot["metadata_blob_ref_count"], 6) for slot in metadata_slots)
+    score += sum(min(slot["tail_cell_count"], 24) for slot in block)
+    score -= sum(
+        25
+        for slot in block
+        if slot["tag_value"] == 0 and slot["metadata_blob_ref_count"] == 0 and slot["dat_ref_count"] == 0
+    )
+    return score
+
+
+def build_compact_slot_recipes(
+    root: Path,
+    template_library: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    fallback = {
+        "audio_file": compact_recipe_from_annotation_kinds(
+            ["dat_u32", "zero_u32", "dat_u32", "zero_u32"],
+            tag_value=5,
+        ),
+        "title": compact_recipe_from_annotation_kinds(
+            ["metadata_blob_u32", "zero_u32", "metadata_blob_u32", "zero_u32", "metadata_blob_u32"],
+            tag_value=0,
+        ),
+        "artist": compact_recipe_from_annotation_kinds(
+            ["metadata_blob_u32", "zero_u32", "metadata_blob_u32"],
+            tag_value=0,
+        ),
+        "album": compact_recipe_from_annotation_kinds(
+            ["metadata_blob_u32", "zero_u32", "metadata_blob_u32"],
+            tag_value=0,
+        ),
+        "genre": compact_recipe_from_annotation_kinds(
+            ["metadata_blob_u32", "zero_u32", "metadata_blob_u32"],
+            tag_value=0,
+        ),
+        "_source_page_index": None,
+    }
+    if not template_library:
+        return fallback
+
+    metadata_blobs = template_library.get("compact_metadata_blob_by_offset")
+    if metadata_blobs is None:
+        return fallback
+
+    files = find_db_files(root)
+    db_idx = files["db.idx"].read_bytes()
+    db_dic = files["db.dic"].read_bytes()
+    db_dat = files["db.dat"].read_bytes()
+    dat_record_by_start = {
+        record.record_start: record
+        for record in collect_dat_records(db_dat)
+    }
+    field_map = {
+        field.entry_offset: field.name
+        for field in parse_db_dic(db_dic)
+    }
+    best_match: tuple[tuple[bool, int, int, int], dict[str, object]] | None = None
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    for page_index in range(page_count):
+        observed = parse_observed_compact_idx_page(
+            db_idx,
+            page_index,
+            dat_record_by_start,
+            field_map,
+            metadata_blobs=metadata_blobs,
+            db_dat_size=len(db_dat),
+            max_slots=32,
+            max_tail_cells=24,
+        )
+        block_scores: dict[int, int] = {}
+        best_single_block: tuple[int, int] | None = None
+        for start_index in range(max(0, observed["slot_count"] - 4)):
+            score = compact_recipe_block_score(observed["slots"], start_index)
+            if score is None:
+                continue
+            block_scores[start_index] = score
+            if best_single_block is None or score > best_single_block[1]:
+                best_single_block = (start_index, score)
+        if best_single_block is None:
+            continue
+        has_two_block_prefix = 0 in block_scores and 5 in block_scores
+        pair_score = (block_scores.get(0, 0) + block_scores.get(5, 0)) if has_two_block_prefix else 0
+        start_index = 0 if has_two_block_prefix else best_single_block[0]
+        rank = (
+            has_two_block_prefix,
+            pair_score,
+            block_scores.get(start_index, 0),
+            -page_index,
+        )
+        candidate = (rank, {"page_index": page_index, "start_index": start_index, "observed": observed})
+        if best_match is None or candidate > best_match:
+            best_match = candidate
+
+    if best_match is None:
+        return fallback
+
+    observed = best_match[1]["observed"]
+    start_index = best_match[1]["start_index"]
+    source_slots = observed["slots"]
+    role_indices = {
+        "audio_file": start_index,
+        "title": start_index + 1,
+        "artist": start_index + 2,
+        "album": start_index + 3,
+        "genre": start_index + 4,
+    }
+
+    recipes = {
+        role: compact_slot_recipe_from_observed_slot(
+            source_slots[slot_index],
+            source_slots,
+            observed["offset"],
+            slot_index,
+            fallback_tag_value=5 if role == "audio_file" else 0,
+        )
+        for role, slot_index in role_indices.items()
+    }
+    recipes["_source_page_index"] = observed["page_index"]
+    return recipes
+
+
+def compact_slot_size(
+    text: str,
+    recipe: dict[str, object],
+) -> int:
+    return 4 + len(pack_utf16be_null_terminated(text)) + (len(recipe["tail_cells"]) * 4)
+
+
+def resolve_compact_slot_tail_values(
+    recipe: dict[str, object],
+    *,
+    blob_offset: int,
+    dat_record_start: int,
+    field_offset: int,
+    page_slots: list[dict[str, object]],
+    slot_index: int,
+) -> list[int]:
+    values: list[int] = []
+    for cell in recipe["tail_cells"]:
+        annotation_kind = cell["annotation_kind"]
+        if annotation_kind == "metadata_blob_u32":
+            values.append(blob_offset)
+            continue
+        if annotation_kind in {"dat_u32", "dat_24"}:
+            values.append(dat_record_start)
+            continue
+        if annotation_kind == "field_u32":
+            values.append(field_offset)
+            continue
+        if annotation_kind == "zero_u32":
+            values.append(0)
+            continue
+        target_slot_delta = cell.get("page_local_target_slot_delta")
+        target_offset = cell.get("page_local_target_offset")
+        if target_slot_delta is not None and target_offset is not None:
+            target_slot_index = slot_index + target_slot_delta
+            if 0 <= target_slot_index < len(page_slots):
+                target_slot = page_slots[target_slot_index]
+                values.append(target_slot["absolute_text_offset"] + target_offset)
+                continue
+            values.append(0)
+            continue
+        values.append(cell.get("source_u32", 0))
+    return values
+
+
+def build_compact_metadata_pages(
+    root: Path,
+    target_library: list[TargetLibraryEntry],
+    dbdat_records: list[TargetDatRecord],
+    metadata_blobs: list[TargetMetadataBlob],
+    db_dic: bytes,
+    *,
+    page_index_base: int = 0,
+    template_library: dict[str, object] | None = None,
+) -> tuple[list[bytes], list[dict[str, object]]]:
+    field_offsets = {
+        field.name: field.entry_offset
+        for field in parse_db_dic(db_dic)
+    }
+    recipes = build_compact_slot_recipes(root, template_library)
+    blob_by_target_path = {
+        blob.target_path: blob
+        for blob in metadata_blobs
+    }
+    record_by_target_path = {
+        record.target_path: record
+        for record in dbdat_records
+        if record.kind == 0x200
+    }
+
+    pages: list[bytes] = []
+    page_summaries: list[dict[str, object]] = []
+    current_offset = 0
+    current_slots: list[dict[str, object]] = []
+
+    def finalize_page(page_index: int) -> None:
+        nonlocal current_offset, current_slots
+        if current_offset == 0:
+            return
+        absolute_page_index = page_index_base + page_index
+        absolute_page_offset = absolute_page_index * IDX_PAGE_SIZE
+        page_bytes = bytearray(IDX_PAGE_SIZE)
+        rendered_slots: list[dict[str, object]] = []
+        for slot in current_slots:
+            slot["absolute_text_offset"] = absolute_page_offset + slot["start_offset"] + 4
+        for slot_index, slot in enumerate(current_slots):
+            tail_values = resolve_compact_slot_tail_values(
+                slot["recipe"],
+                blob_offset=slot["blob_offset"],
+                dat_record_start=slot["dat_record_start"],
+                field_offset=slot["field_offset"],
+                page_slots=current_slots,
+                slot_index=slot_index,
+            )
+            slot_bytes = compact_slot_bytes(
+                slot["text"],
+                tail_values,
+                tag_value=slot["recipe"]["tag_value"],
+            )
+            start = slot["start_offset"]
+            page_bytes[start:start + len(slot_bytes)] = slot_bytes
+            rendered_slots.append(
+                {
+                    "field_name": slot["field_name"],
+                    "target_path": slot["target_path"],
+                    "object_id": slot["object_id"],
+                    "blob_offset": slot["blob_offset"],
+                    "blob_offset_hex": f"0x{slot['blob_offset']:08x}",
+                    "text": slot["text"],
+                    "tag_value": slot["recipe"]["tag_value"],
+                    "tail_cell_count": len(tail_values),
+                    "bytes": len(slot_bytes),
+                    "recipe_source_slot_index": slot["recipe"].get("source_slot_index"),
+                }
+            )
+        pages.append(bytes(page_bytes))
+        page_summaries.append(
+            {
+                "page_index": page_index,
+                "absolute_page_index": absolute_page_index,
+                "page_family": "compact_metadata_page",
+                "slot_count": len(rendered_slots),
+                "bytes_used": current_offset,
+                "template_source_page_index": recipes.get("_source_page_index"),
+                "items": rendered_slots,
+            }
+        )
+        current_offset = 0
+        current_slots = []
+
+    planned_entries = sorted(
+        (entry for entry in target_library if entry.source_kind == "planned_addition"),
+        key=lambda entry: entry.target_path.lower(),
+    )
+    for entry in planned_entries:
+        record = record_by_target_path.get(entry.target_path)
+        blob = blob_by_target_path.get(entry.target_path)
+        if record is None or blob is None:
+            continue
+        slot_specs: list[tuple[str, str, dict[str, object], int]] = []
+        title_text = blob.title
+        if title_text:
+            slot_specs.append(("Title", title_text, recipes["title"], field_offsets.get("Title", 0)))
+        if blob.artist:
+            slot_specs.append(("Artist", blob.artist, recipes["artist"], field_offsets.get("Artist", 0)))
+        if blob.album:
+            slot_specs.append(("Album", blob.album, recipes["album"], field_offsets.get("Album", 0)))
+        if blob.genre:
+            slot_specs.append(("Genre", blob.genre, recipes["genre"], field_offsets.get("Genre", 0)))
+        slot_specs.append(("FileName", entry.file_name, recipes["audio_file"], field_offsets.get("FileName", 0)))
+
+        for field_name, text, recipe, field_offset in slot_specs:
+            slot_size = compact_slot_size(text, recipe)
+            if current_offset and current_offset + slot_size > IDX_PAGE_SIZE:
+                finalize_page(len(pages))
+            if slot_size > IDX_PAGE_SIZE:
+                raise ValueError(f"One compact metadata slot exceeds page size: {entry.target_path} [{field_name}]")
+            current_slots.append(
+                {
+                    "field_name": field_name,
+                    "target_path": entry.target_path,
+                    "object_id": record.object_id,
+                    "text": text,
+                    "recipe": recipe,
+                    "blob_offset": blob.offset,
+                    "dat_record_start": record.record_start,
+                    "field_offset": field_offset,
+                    "start_offset": current_offset,
+                    "bytes": slot_size,
+                }
+            )
+            current_offset += slot_size
+
+    if current_offset:
+        finalize_page(len(pages))
+    return pages, page_summaries
+
+
+def build_idx_addition_pages(
+    root: Path,
+    planned_entries: list[TargetLibraryEntry],
+    dbdat_records: list[TargetDatRecord],
+    metadata_blobs: list[TargetMetadataBlob],
+    db_dic: bytes,
+    *,
+    page_index_base: int = 0,
+    template_library: dict[str, object] | None = None,
+    include_title_chains: bool = False,
+) -> tuple[list[bytes], list[dict[str, object]]]:
+    include_chain_families = {"dat_folder", "dat_audio_file"}
+    if include_title_chains:
+        include_chain_families.add("dat_audio_title")
+    chain_pages, chain_summaries = build_idx_prototype_pages(
+        root,
+        planned_entries,
+        dbdat_records,
+        db_dic,
+        page_index_base=page_index_base,
+        include_chain_families=include_chain_families,
+        template_library=template_library,
+    )
+    compact_pages, compact_summaries = build_compact_metadata_pages(
+        root,
+        planned_entries,
+        dbdat_records,
+        metadata_blobs,
+        db_dic,
+        page_index_base=page_index_base + len(chain_pages),
+        template_library=template_library,
+    )
+    return chain_pages + compact_pages, chain_summaries + compact_summaries
+
+
 def build_idx_prototype_pages(
     root: Path,
     target_library: list[TargetLibraryEntry],
     dbdat_records: list[TargetDatRecord],
     db_dic: bytes,
+    page_index_base: int = 0,
+    include_chain_families: set[str] | None = None,
+    metadata_field_order: list[str] | None = None,
+    template_library: dict[str, object] | None = None,
 ) -> tuple[list[bytes], list[dict[str, object]]]:
     field_offsets = {
         field.name: field.entry_offset
@@ -1331,8 +2802,16 @@ def build_idx_prototype_pages(
         for record in dbdat_records
         if record.kind == 0x200
     }
+    special_root_records = sorted(
+        (record for record in dbdat_records if record.kind == 0x0),
+        key=lambda record: (record.record_start, record.text),
+    )
     folder_records = sorted(
         (record for record in dbdat_records if record.kind == 0x100),
+        key=lambda record: (record.target_path.lower(), record.record_start),
+    )
+    playlist_records = sorted(
+        (record for record in dbdat_records if record.kind == 0x400),
         key=lambda record: (record.target_path.lower(), record.record_start),
     )
 
@@ -1341,6 +2820,10 @@ def build_idx_prototype_pages(
     current_chains: list[dict[str, object]] = []
     current_nodes: list[dict[str, object]] = []
     current_offset = IDX_OBSERVED_HEADER_BYTES
+    metadata_field_order = metadata_field_order or ["Artist", "Genre", "Album", "Title", "Duration", "BitRate", "SampleRate"]
+    selected_templates: dict[str, ObservedIdxChainTemplate] = {}
+    if template_library:
+        selected_templates = template_library.get("selected_templates", {})
 
     def make_text_node(field_name: str, node_type: int, text: str) -> dict[str, object]:
         return {
@@ -1362,12 +2845,78 @@ def build_idx_prototype_pages(
             "payload_text": "",
         }
 
+    def make_empty_tail_node() -> dict[str, object]:
+        # Original pages commonly put a non-payload node after a text-bearing node.
+        # Without that delimiter, a single-node chain with next=0 consumes the rest
+        # of the page as payload and hides later chains from the firmware/parser.
+        return {
+            "field_name": "",
+            "field_entry_offset": 0,
+            "value": 0,
+            "node_type": 0,
+            "payload": b"",
+            "payload_text": "",
+        }
+
+    def fallback_record_nodes(record: TargetDatRecord, chain_family: str) -> list[dict[str, object]]:
+        if chain_family == "dat_special_root":
+            return [make_text_node("RMusic", 0x03, record.text)]
+        if chain_family == "dat_folder":
+            return [make_text_node("FilePath", 0x05, clean_folder_name(record.text) + "/")]
+        if chain_family == "dat_playlist":
+            return [make_text_node("FileName", 0x03, record.text)]
+        raise ValueError(f"Unhandled record fallback chain family: {chain_family}")
+
+    def record_chain_nodes(record: TargetDatRecord, chain_family: str) -> list[dict[str, object]]:
+        nodes = instantiate_observed_chain_template(
+            selected_templates.get(chain_family),
+            field_offsets=field_offsets,
+            text_values=idx_text_values_for_record(record),
+        )
+        return nodes or fallback_record_nodes(record, chain_family)
+
+    def fallback_entry_chain_nodes(entry: TargetLibraryEntry, chain_family: str) -> list[dict[str, object]]:
+        title_text = target_title_for_idx(entry)
+        if chain_family == "dat_audio_file":
+            return [make_text_node("FileName", 0x03, entry.file_name)]
+        if chain_family == "dat_audio_title":
+            return [make_text_node("Title", 0x09, title_text)]
+        if chain_family == "non_dat_metadata":
+            nodes: list[dict[str, object]] = []
+            if "Artist" in metadata_field_order and entry.artist:
+                nodes.append(make_text_node("Artist", 0x02, entry.artist))
+            if "Genre" in metadata_field_order and entry.genre:
+                nodes.append(make_text_node("Genre", 0x03, entry.genre))
+            if "Album" in metadata_field_order and entry.album:
+                nodes.append(make_text_node("Album", 0x04, entry.album))
+            if "Title" in metadata_field_order and title_text:
+                nodes.append(make_text_node("Title", 0x07, title_text))
+            duration_ms = int((entry.duration_seconds or 0) * 1000)
+            if "Duration" in metadata_field_order and duration_ms:
+                nodes.append(make_numeric_node("Duration", 0x01, duration_ms))
+            if "BitRate" in metadata_field_order and entry.bit_rate_bps:
+                nodes.append(make_numeric_node("BitRate", 0x01, entry.bit_rate_bps))
+            if "SampleRate" in metadata_field_order and entry.sample_rate_hz:
+                nodes.append(make_numeric_node("SampleRate", 0x01, entry.sample_rate_hz))
+            return nodes
+        raise ValueError(f"Unhandled entry fallback chain family: {chain_family}")
+
+    def entry_chain_nodes(entry: TargetLibraryEntry, chain_family: str) -> list[dict[str, object]]:
+        nodes = instantiate_observed_chain_template(
+            selected_templates.get(chain_family),
+            field_offsets=field_offsets,
+            text_values=idx_text_values_for_entry(entry),
+            numeric_values=idx_numeric_values_for_entry(entry),
+        )
+        return nodes or fallback_entry_chain_nodes(entry, chain_family)
+
     def finalize_page(page_index: int) -> None:
         nonlocal current_offset
         if not current_nodes:
             return
         page = bytearray(IDX_PAGE_SIZE)
-        page_base = page_index * IDX_PAGE_SIZE
+        absolute_page_index = page_index_base + page_index
+        page_base = absolute_page_index * IDX_PAGE_SIZE
         first_node_abs_offset = page_base + current_nodes[0]["start_rel"]
         last_node_abs_offset = page_base + current_nodes[-1]["start_rel"]
         struct.pack_into(">I", page, 0, first_node_abs_offset)
@@ -1396,6 +2945,7 @@ def build_idx_prototype_pages(
         page_summaries.append(
             {
                 "page_index": page_index,
+                "absolute_page_index": absolute_page_index,
                 "item_count": len(current_chains),
                 "chain_count": len(current_chains),
                 "node_count": len(current_nodes),
@@ -1409,6 +2959,7 @@ def build_idx_prototype_pages(
                         "object_id": item["object_id"],
                         "anchor_value": item["anchor_value"],
                         "anchor_value_hex": f"0x{item['anchor_value']:08x}",
+                        "template_source_page_index": item.get("template_source_page_index"),
                         "flags": item["flags"],
                         "node_count": item["node_count"],
                     }
@@ -1422,7 +2973,21 @@ def build_idx_prototype_pages(
 
     chain_specs: list[dict[str, object]] = []
 
+    for record in special_root_records:
+        chain_specs.append(
+            {
+                "chain_family": "dat_special_root",
+                "target_path": record.target_path,
+                "object_id": record.object_id,
+                "anchor_value": record.record_start,
+                "flags": 1,
+                "nodes": record_chain_nodes(record, "dat_special_root"),
+            }
+        )
+
     for record in folder_records:
+        if record.parent_id == 0xFFFFFFFF:
+            continue
         folder_name = clean_folder_name(record.text) + "/"
         chain_specs.append(
             {
@@ -1431,7 +2996,19 @@ def build_idx_prototype_pages(
                 "object_id": record.object_id,
                 "anchor_value": record.record_start,
                 "flags": 1,
-                "nodes": [make_text_node("FilePath", 0x05, folder_name)],
+                "nodes": record_chain_nodes(record, "dat_folder"),
+            }
+        )
+
+    for record in playlist_records:
+        chain_specs.append(
+            {
+                "chain_family": "dat_playlist",
+                "target_path": record.target_path,
+                "object_id": record.object_id,
+                "anchor_value": record.record_start,
+                "flags": 1,
+                "nodes": record_chain_nodes(record, "dat_playlist"),
             }
         )
 
@@ -1449,7 +3026,7 @@ def build_idx_prototype_pages(
                 "object_id": dbdat_record.object_id,
                 "anchor_value": dbdat_record.record_start,
                 "flags": flags,
-                "nodes": [make_text_node("FileName", 0x03, entry.file_name)],
+                "nodes": entry_chain_nodes(entry, "dat_audio_file"),
             }
         )
 
@@ -1461,26 +3038,11 @@ def build_idx_prototype_pages(
                     "object_id": dbdat_record.object_id,
                     "anchor_value": dbdat_record.record_start,
                     "flags": flags,
-                    "nodes": [make_text_node("Title", 0x09, title_text)],
+                    "nodes": entry_chain_nodes(entry, "dat_audio_title"),
                 }
             )
 
-        metadata_nodes: list[dict[str, object]] = []
-        if entry.artist:
-            metadata_nodes.append(make_text_node("Artist", 0x02, entry.artist))
-        if entry.genre:
-            metadata_nodes.append(make_text_node("Genre", 0x03, entry.genre))
-        if entry.album:
-            metadata_nodes.append(make_text_node("Album", 0x04, entry.album))
-        if title_text:
-            metadata_nodes.append(make_text_node("Title", 0x07, title_text))
-        duration_ms = int((entry.duration_seconds or 0) * 1000)
-        if duration_ms:
-            metadata_nodes.append(make_numeric_node("Duration", 0x01, duration_ms))
-        if entry.bit_rate_bps:
-            metadata_nodes.append(make_numeric_node("BitRate", 0x01, entry.bit_rate_bps))
-        if entry.sample_rate_hz:
-            metadata_nodes.append(make_numeric_node("SampleRate", 0x01, entry.sample_rate_hz))
+        metadata_nodes = entry_chain_nodes(entry, "non_dat_metadata")
         if metadata_nodes:
             chain_specs.append(
                 {
@@ -1493,9 +3055,18 @@ def build_idx_prototype_pages(
                 }
             )
 
+    if include_chain_families is not None:
+        chain_specs = [
+            chain
+            for chain in chain_specs
+            if chain["chain_family"] in include_chain_families
+        ]
+
     chain_specs.sort(key=lambda item: (item["target_path"].lower(), item["chain_family"], item["anchor_value"]))
 
     for chain in chain_specs:
+        if len(chain["nodes"]) == 1 and chain["nodes"][0]["payload"]:
+            chain["nodes"] = [*chain["nodes"], make_empty_tail_node()]
         chain_size = sum(IDX_OBSERVED_NODE_BYTES + len(node["payload"]) for node in chain["nodes"])
         if current_chains and current_offset + chain_size > IDX_PAGE_SIZE:
             finalize_page(len(pages))
@@ -1520,6 +3091,11 @@ def build_idx_prototype_pages(
                 "target_path": chain["target_path"],
                 "object_id": chain["object_id"],
                 "anchor_value": chain["anchor_value"],
+                "template_source_page_index": (
+                    selected_templates.get(chain["chain_family"]).source_page_index
+                    if selected_templates.get(chain["chain_family"]) is not None
+                    else None
+                ),
                 "flags": chain["flags"],
                 "node_count": len(chain_nodes),
                 "start_rel": chain_start_rel,
@@ -1530,6 +3106,82 @@ def build_idx_prototype_pages(
         finalize_page(len(pages))
 
     return pages, page_summaries
+
+
+def trailing_zero_page_indices(db_idx: bytes) -> list[int]:
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    zero_pages: list[int] = []
+    for page_index in range(page_count - 1, -1, -1):
+        block = db_idx[page_index * IDX_PAGE_SIZE:(page_index + 1) * IDX_PAGE_SIZE]
+        if any(block):
+            break
+        zero_pages.append(page_index)
+    return list(reversed(zero_pages))
+
+
+def build_compact_idx_overlay(
+    root: Path,
+    original_idx: bytes,
+    planned_entries: list[TargetLibraryEntry],
+    dbdat_records: list[TargetDatRecord],
+    metadata_blobs: list[TargetMetadataBlob],
+    db_dic: bytes,
+    template_library: dict[str, object] | None = None,
+) -> tuple[bytes, list[dict[str, object]], list[TargetLibraryEntry]] | None:
+    zero_pages = trailing_zero_page_indices(original_idx)
+    if not zero_pages:
+        return None
+
+    max_pages = len(zero_pages)
+    sorted_entries = sorted(planned_entries, key=lambda entry: entry.target_path.lower())
+    selected_entries: list[TargetLibraryEntry] = []
+    selected_pages: list[bytes] = []
+    selected_summaries: list[dict[str, object]] = []
+
+    for count in range(len(sorted_entries), 0, -1):
+        candidate_entries = sorted_entries[:count]
+        candidate_records = select_idx_extension_dbdat_records(dbdat_records, candidate_entries)
+        candidate_blobs = [
+            blob
+            for blob in metadata_blobs
+            if blob.target_path in {entry.target_path for entry in candidate_entries}
+        ]
+        candidate_pages, candidate_summaries = build_idx_addition_pages(
+            root,
+            candidate_entries,
+            candidate_records,
+            candidate_blobs,
+            db_dic,
+            page_index_base=zero_pages[0],
+            template_library=template_library,
+        )
+        if len(candidate_pages) <= max_pages:
+            selected_entries = candidate_entries
+            selected_pages = candidate_pages
+            selected_summaries = candidate_summaries
+            break
+
+    if not selected_pages:
+        return None
+
+    idx_bytes = bytearray(original_idx)
+    for page_offset, page_bytes in zip(zero_pages, selected_pages):
+        start = page_offset * IDX_PAGE_SIZE
+        idx_bytes[start:start + IDX_PAGE_SIZE] = page_bytes
+
+    overlay_summary = [
+        {
+            "mode": "compact_inplace_overlay",
+            "overlay_page_indices": zero_pages,
+            "overlay_page_count": len(selected_pages),
+            "available_zero_page_count": len(zero_pages),
+            "included_planned_entry_count": len(selected_entries),
+            "omitted_planned_entry_count": len(planned_entries) - len(selected_entries),
+            "included_target_paths": [entry.target_path for entry in selected_entries],
+        },
+        *selected_summaries,
+    ]
+    return bytes(idx_bytes), overlay_summary, selected_entries
 
 
 def parse_idx_prototype_pages(data: bytes) -> list[dict[str, object]]:
@@ -1960,12 +3612,58 @@ def command_idx_observed_page(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_idx_observed_summary(args: argparse.Namespace) -> int:
+def command_idx_compact_page(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     files = find_db_files(root)
     db_idx = files["db.idx"].read_bytes()
     db_dic = files["db.dic"].read_bytes()
     db_dat = files["db.dat"].read_bytes()
+    dic_fields = parse_db_dic(db_dic)
+    dat_records = collect_dat_records(db_dat)
+    dat_record_by_start = {record.record_start: record for record in dat_records}
+    field_map = {field.entry_offset: field.name for field in dic_fields}
+    compact_library = build_observed_compact_idx_template_library(db_idx, db_dic, db_dat)
+    metadata_blobs = compact_library["metadata_blob_by_offset"]
+
+    page_count = len(db_idx) // IDX_PAGE_SIZE
+    selected_pages = range(page_count) if args.page is None else [args.page]
+    pages = [
+        parse_observed_compact_idx_page(
+            db_idx,
+            page_index,
+            dat_record_by_start,
+            field_map,
+            metadata_blobs=metadata_blobs,
+            db_dat_size=len(db_dat),
+            max_slots=args.max_slots,
+            max_tail_cells=args.max_tail_cells,
+        )
+        for page_index in selected_pages
+    ]
+
+    report = {
+        "root": str(root),
+        "page_size": IDX_PAGE_SIZE,
+        "page_count": page_count,
+        "compact_family_count": compact_library["family_count"],
+        "compact_metadata_blob_count": compact_library["metadata_blob_count"],
+        "pages": pages,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def summarize_observed_idx(
+    db_idx: bytes,
+    db_dic: bytes,
+    db_dat: bytes,
+    *,
+    limit: int = 20,
+    max_nodes: int = 128,
+    max_groups: int = 32,
+    example_limit: int = 5,
+) -> dict[str, object]:
     dic_fields = parse_db_dic(db_dic)
     dat_records = collect_dat_records(db_dat)
     dat_record_by_start = {record.record_start: record for record in dat_records}
@@ -1985,8 +3683,8 @@ def command_idx_observed_summary(args: argparse.Namespace) -> int:
             db_idx,
             page_index,
             annotation_maps,
-            max_nodes=args.max_nodes,
-            max_groups=args.max_groups,
+            max_nodes=max_nodes,
+            max_groups=max_groups,
         )
         for chain in parsed["chains"]:
             anchor_annotation = chain["anchor_annotation"]
@@ -2009,7 +3707,7 @@ def command_idx_observed_summary(args: argparse.Namespace) -> int:
             if anchor_annotation:
                 anchor_annotation_counts[anchor_annotation] = anchor_annotation_counts.get(anchor_annotation, 0) + 1
             examples = anchor_class_examples.setdefault(anchor_class, [])
-            if len(examples) < args.example_limit:
+            if len(examples) < example_limit:
                 examples.append(
                     {
                         "page_index": parsed["page_index"],
@@ -2047,33 +3745,154 @@ def command_idx_observed_summary(args: argparse.Namespace) -> int:
                 bucket = node_type_by_payload_class.setdefault(node_type, {})
                 bucket[payload_class] = bucket.get(payload_class, 0) + 1
 
-    report = {
-        "root": str(root),
+    return {
         "page_count": page_count,
         "chain_count": sum(chain_length_counts.values()),
-        "chain_length_counts": [{"node_count": k, "count": v} for k, v in sorted(chain_length_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
+        "chain_length_counts": [{"node_count": k, "count": v} for k, v in sorted(chain_length_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]],
         "anchor_class_counts": [{"anchor_class": k, "count": v} for k, v in sorted(anchor_class_counts.items(), key=lambda item: (-item[1], item[0]))],
-        "top_anchor_annotations": [{"anchor_annotation": k, "count": v} for k, v in sorted(anchor_annotation_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
-        "node_type_counts": [{"node_type": k, "count": v} for k, v in sorted(node_type_counts.items(), key=lambda item: (-item[1], item[0]))[: args.limit]],
+        "top_anchor_annotations": [{"anchor_annotation": k, "count": v} for k, v in sorted(anchor_annotation_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]],
+        "node_type_counts": [{"node_type": k, "count": v} for k, v in sorted(node_type_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]],
         "node_type_by_payload_class": [
             {"node_type": node_type, "payload_classes": payloads}
             for node_type, payloads in sorted(
                 node_type_by_payload_class.items(),
                 key=lambda item: (-sum(item[1].values()), item[0]),
-            )[: args.limit]
+            )[:limit]
         ],
         "node_type_by_anchor_class": [
             {"node_type": node_type, "anchor_classes": classes}
             for node_type, classes in sorted(
                 node_type_by_anchor_class.items(),
                 key=lambda item: (-sum(item[1].values()), item[0]),
-            )[: args.limit]
+            )[:limit]
         ],
         "anchor_class_examples": anchor_class_examples,
+    }
+
+
+def command_idx_observed_summary(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    files = find_db_files(root)
+    report = {
+        "root": str(root),
+        **summarize_observed_idx(
+            files["db.idx"].read_bytes(),
+            files["db.dic"].read_bytes(),
+            files["db.dat"].read_bytes(),
+            limit=args.limit,
+            max_nodes=args.max_nodes,
+            max_groups=args.max_groups,
+            example_limit=args.example_limit,
+        ),
     }
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
+
+
+def command_idx_template_summary(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    files = find_db_files(root)
+    template_library = build_observed_idx_template_library(
+        files["db.idx"].read_bytes(),
+        files["db.dic"].read_bytes(),
+        files["db.dat"].read_bytes(),
+        max_nodes=args.max_nodes,
+        max_groups=args.max_groups,
+    )
+    report = {
+        "root": str(root),
+        "page_count": template_library["page_count"],
+        "family_count": template_library["family_count"],
+        "chain_family_count": template_library["chain_family_count"],
+        "compact_family_count": template_library["compact_family_count"],
+        "compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
+        "families": template_library["family_summaries"],
+        "compact_families": template_library["compact_family_summaries"],
+        "compact_metadata_blobs": template_library["compact_metadata_blobs"],
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def count_summary_entries(items: list[dict[str, object]], key_field: str) -> dict[str, int]:
+    return {
+        str(item[key_field]): int(item["count"])
+        for item in items
+    }
+
+
+def assess_install_safety(
+    current_dbdat: bytes,
+    current_idx: bytes,
+    current_dic: bytes,
+    prototype_dbdat: bytes,
+    prototype_idx: bytes,
+    target_library_entry_count: int | None,
+) -> dict[str, object]:
+    current_idx_hits = extract_db_idx_strings(current_idx)
+    prototype_idx_hits = extract_db_idx_strings(prototype_idx)
+    current_observed = summarize_observed_idx(current_idx, current_dic, current_dbdat, example_limit=0)
+    prototype_observed = summarize_observed_idx(prototype_idx, current_dic, prototype_dbdat, example_limit=0)
+    current_anchor_counts = count_summary_entries(current_observed["anchor_class_counts"], "anchor_class")
+    prototype_anchor_counts = count_summary_entries(prototype_observed["anchor_class_counts"], "anchor_class")
+    current_audio_name_count = len(database_audio_names(extract_db_dat_strings(current_dbdat), current_idx_hits))
+    prototype_audio_name_count = len(database_audio_names(extract_db_dat_strings(prototype_dbdat), prototype_idx_hits))
+
+    issues: list[str] = []
+
+    current_chain_count = int(current_observed["chain_count"])
+    prototype_chain_count = int(prototype_observed["chain_count"])
+    if current_chain_count and prototype_chain_count < max(1, current_chain_count // 2):
+        issues.append(
+            "prototype db.idx exposes far fewer observed chains than the current device database "
+            f"({prototype_chain_count} vs {current_chain_count})"
+        )
+
+    current_dat_audio = current_anchor_counts.get("dat_audio", 0)
+    prototype_dat_audio = prototype_anchor_counts.get("dat_audio", 0)
+    if current_dat_audio and prototype_dat_audio < max(1, current_dat_audio // 2):
+        issues.append(
+            "prototype db.idx exposes far fewer audio-anchored chains than the current device database "
+            f"({prototype_dat_audio} vs {current_dat_audio})"
+        )
+
+    current_non_dat = current_anchor_counts.get("non_dat", 0)
+    prototype_non_dat = prototype_anchor_counts.get("non_dat", 0)
+    if current_non_dat and prototype_non_dat < max(1, current_non_dat // 2):
+        issues.append(
+            "prototype db.idx exposes far fewer metadata/non-dat chains than the current device database "
+            f"({prototype_non_dat} vs {current_non_dat})"
+        )
+
+    if current_idx_hits and len(prototype_idx_hits) < max(1, int(len(current_idx_hits) * 0.65)):
+        issues.append(
+            "prototype db.idx contains far fewer UTF-16BE strings than the current device database "
+            f"({len(prototype_idx_hits)} vs {len(current_idx_hits)})"
+        )
+
+    if target_library_entry_count is not None and prototype_audio_name_count < target_library_entry_count:
+        issues.append(
+            "prototype database advertises fewer audio names than the target library requires "
+            f"({prototype_audio_name_count} vs {target_library_entry_count})"
+        )
+
+    return {
+        "issues": issues,
+        "current": {
+            "idx_string_count": len(current_idx_hits),
+            "audio_name_count": current_audio_name_count,
+            "observed_chain_count": current_chain_count,
+            "anchor_class_counts": current_anchor_counts,
+        },
+        "prototype": {
+            "idx_string_count": len(prototype_idx_hits),
+            "audio_name_count": prototype_audio_name_count,
+            "observed_chain_count": prototype_chain_count,
+            "anchor_class_counts": prototype_anchor_counts,
+        },
+    }
 
 
 def command_dat_tree(args: argparse.Namespace) -> int:
@@ -2292,7 +4111,11 @@ def command_write_rebuild_snapshot(args: argparse.Namespace) -> int:
         max_collisions=args.max_collisions,
     )
     canonical_entries: list[NormalizedMediaEntry] = plan["canonical_entries"]
-    target_library = build_target_library_entries(canonical_entries, plan["planned_additions"])
+    target_library = build_target_library_entries(
+        canonical_entries,
+        plan["planned_additions"],
+        existing_object_id_floor=max_preserved_object_id(root),
+    )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -2364,22 +4187,32 @@ def command_write_dbdat_prototype(args: argparse.Namespace) -> int:
         inventory_paths=inventory_paths,
         max_collisions=args.max_collisions,
     )
-    target_library = build_target_library_entries(plan["canonical_entries"], plan["planned_additions"])
+    target_library = build_target_library_entries(
+        plan["canonical_entries"],
+        plan["planned_additions"],
+        existing_object_id_floor=max_preserved_object_id(root),
+    )
     records = build_dbdat_prototype_records(root, target_library)
-    dbdat_bytes = serialize_dbdat_prototype(records)
+    metadata_blobs = build_dbdat_metadata_blobs(root, target_library, records)
+    original_dbdat = find_db_files(root)["db.dat"].read_bytes()
+    dbdat_bytes = serialize_dbdat_prototype(records, base_bytes=original_dbdat, metadata_blobs=metadata_blobs)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     dbdat_path = out_dir / "db.dat.prototype"
     records_path = out_dir / "db.dat.records.json"
+    blobs_path = out_dir / "db.dat.metadata_blobs.json"
     dbdat_path.write_bytes(dbdat_bytes)
     records_path.write_text(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    blobs_path.write_text(json.dumps([asdict(blob) for blob in metadata_blobs], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     reparsed = validated_folder_file_records(dbdat_bytes)
     report = {
         "out_dir": str(out_dir),
         "dbdat_path": str(dbdat_path),
         "records_path": str(records_path),
+        "blobs_path": str(blobs_path),
         "record_count": len(records),
+        "metadata_blob_count": len(metadata_blobs),
         "serialized_size_bytes": len(dbdat_bytes),
         "reparsed_record_count": len(reparsed),
         "planned_addition_count": len(plan["planned_additions"]),
@@ -2405,27 +4238,108 @@ def command_write_idx_prototype(args: argparse.Namespace) -> int:
         inventory_paths=inventory_paths,
         max_collisions=args.max_collisions,
     )
-    target_library = build_target_library_entries(plan["canonical_entries"], plan["planned_additions"])
+    target_library = build_target_library_entries(
+        plan["canonical_entries"],
+        plan["planned_additions"],
+        existing_object_id_floor=max_preserved_object_id(root),
+    )
     dbdat_records = build_dbdat_prototype_records(root, target_library)
-    pages, page_summaries = build_idx_prototype_pages(root, target_library, dbdat_records, db_dic)
-    idx_bytes = b"".join(pages)
+    metadata_blobs = build_dbdat_metadata_blobs(root, target_library, dbdat_records)
+    template_library = build_observed_idx_template_library(
+        files["db.idx"].read_bytes(),
+        db_dic,
+        files["db.dat"].read_bytes(),
+    )
+    if not plan["planned_additions"]:
+        idx_bytes = files["db.idx"].read_bytes()
+        pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+        page_summaries = [{"mode": "preserved_original", "page_count": len(pages)}]
+    else:
+        original_idx = files["db.idx"].read_bytes()
+        original_page_count = len(original_idx) // IDX_PAGE_SIZE
+        planned_entries = [entry for entry in target_library if entry.source_kind == "planned_addition"]
+        compact_overlay = build_compact_idx_overlay(
+            root,
+            original_idx,
+            planned_entries,
+            dbdat_records,
+            metadata_blobs,
+            db_dic,
+            template_library=template_library,
+        )
+        if compact_overlay is not None:
+            idx_bytes, page_summaries, _selected_entries = compact_overlay
+            pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+        else:
+            extension_records = select_idx_extension_dbdat_records(dbdat_records, planned_entries)
+            extension_blobs = [
+                blob
+                for blob in metadata_blobs
+                if blob.target_path in {entry.target_path for entry in planned_entries}
+            ]
+            extension_pages, page_summaries = build_idx_addition_pages(
+                root,
+                planned_entries,
+                extension_records,
+                extension_blobs,
+                db_dic,
+                page_index_base=original_page_count,
+                template_library=template_library,
+            )
+            idx_bytes = original_idx + b"".join(extension_pages)
+            pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+            page_summaries = [
+                {
+                    "mode": "preserved_original_plus_extension",
+                    "original_page_count": original_page_count,
+                    "extension_page_count": len(extension_pages),
+                    "template_family_count": template_library["family_count"],
+                },
+                *page_summaries,
+            ]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     idx_path = out_dir / "db.idx.prototype"
     pages_path = out_dir / "db.idx.pages.json"
+    templates_path = out_dir / "db.idx.templates.json"
+    blobs_path = out_dir / "db.dat.metadata_blobs.json"
     idx_path.write_bytes(idx_bytes)
     pages_path.write_text(json.dumps(page_summaries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    blobs_path.write_text(json.dumps([asdict(blob) for blob in metadata_blobs], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    templates_path.write_text(
+        json.dumps(
+            {
+                "page_count": template_library["page_count"],
+                "family_count": template_library["family_count"],
+                "families": template_library["family_summaries"],
+                "chain_family_count": template_library["chain_family_count"],
+                "compact_family_count": template_library["compact_family_count"],
+                "compact_families": template_library["compact_family_summaries"],
+                "compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
+                "compact_metadata_blobs": template_library["compact_metadata_blobs"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
 
     reparsed_pages = parse_idx_prototype_pages(idx_bytes)
     report = {
         "out_dir": str(out_dir),
         "idx_path": str(idx_path),
         "pages_path": str(pages_path),
+        "templates_path": str(templates_path),
+        "blobs_path": str(blobs_path),
         "page_count": len(pages),
         "serialized_size_bytes": len(idx_bytes),
         "reparsed_page_count": len(reparsed_pages),
         "target_library_entry_count": len(target_library),
         "planned_addition_count": len(plan["planned_additions"]),
+        "metadata_blob_count": len(metadata_blobs),
+        "template_family_count": template_library["family_count"],
+        "compact_template_family_count": template_library["compact_family_count"],
+        "compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
     }
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -2448,11 +4362,79 @@ def command_write_rebuild_prototype(args: argparse.Namespace) -> int:
         max_collisions=args.max_collisions,
     )
     canonical_entries: list[NormalizedMediaEntry] = plan["canonical_entries"]
-    target_library = build_target_library_entries(canonical_entries, plan["planned_additions"])
+    target_library = build_target_library_entries(
+        canonical_entries,
+        plan["planned_additions"],
+        existing_object_id_floor=max_preserved_object_id(root),
+    )
     records = build_dbdat_prototype_records(root, target_library)
-    dbdat_bytes = serialize_dbdat_prototype(records)
-    pages, page_summaries = build_idx_prototype_pages(root, target_library, records, db_dic)
-    idx_bytes = b"".join(pages)
+    metadata_blobs = build_dbdat_metadata_blobs(root, target_library, records)
+    original_dbdat = find_db_files(root)["db.dat"].read_bytes()
+    dbdat_bytes = serialize_dbdat_prototype(records, base_bytes=original_dbdat, metadata_blobs=metadata_blobs)
+    template_library = build_observed_idx_template_library(
+        files["db.idx"].read_bytes(),
+        db_dic,
+        files["db.dat"].read_bytes(),
+    )
+    manifest_note: dict[str, object] = {}
+    if not plan["planned_additions"]:
+        idx_bytes = files["db.idx"].read_bytes()
+        pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+        page_summaries = [{"mode": "preserved_original", "page_count": len(pages)}]
+    else:
+        original_idx = files["db.idx"].read_bytes()
+        original_page_count = len(original_idx) // IDX_PAGE_SIZE
+        planned_entries = [entry for entry in target_library if entry.source_kind == "planned_addition"]
+        compact_overlay = build_compact_idx_overlay(
+            root,
+            original_idx,
+            planned_entries,
+            records,
+            metadata_blobs,
+            db_dic,
+            template_library=template_library,
+        )
+        if compact_overlay is not None:
+            idx_bytes, page_summaries, selected_entries = compact_overlay
+            pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+            if len(selected_entries) != len(planned_entries):
+                manifest_note = {
+                    "compact_overlay_included_planned_entry_count": len(selected_entries),
+                    "compact_overlay_omitted_planned_entry_count": len(planned_entries) - len(selected_entries),
+                }
+            else:
+                manifest_note = {}
+        else:
+            extension_records = select_idx_extension_dbdat_records(records, planned_entries)
+            extension_blobs = [
+                blob
+                for blob in metadata_blobs
+                if blob.target_path in {entry.target_path for entry in planned_entries}
+            ]
+            extension_pages, page_summaries = build_idx_addition_pages(
+                root,
+                planned_entries,
+                extension_records,
+                extension_blobs,
+                db_dic,
+                page_index_base=original_page_count,
+                template_library=template_library,
+            )
+            idx_bytes = original_idx + b"".join(extension_pages)
+            pages = [idx_bytes[index:index + IDX_PAGE_SIZE] for index in range(0, len(idx_bytes), IDX_PAGE_SIZE)]
+            page_summaries = [
+                {
+                    "mode": "preserved_original_plus_extension",
+                    "original_page_count": original_page_count,
+                    "extension_page_count": len(extension_pages),
+                    "template_family_count": template_library["family_count"],
+                },
+                *page_summaries,
+            ]
+            manifest_note = {}
+
+    reparsed_records = validated_folder_file_records(dbdat_bytes)
+    reparsed_pages = parse_idx_prototype_pages(idx_bytes)
 
     manifest = {
         "root": str(root),
@@ -2464,39 +4446,71 @@ def command_write_rebuild_prototype(args: argparse.Namespace) -> int:
         "name_collision_count": len(plan["name_collisions"]),
         "target_library_entry_count": len(target_library),
         "dbdat_record_count": len(records),
+        "dbdat_reparsed_record_count": len(reparsed_records),
         "dbdat_serialized_size_bytes": len(dbdat_bytes),
+        "dbdat_metadata_blob_count": len(metadata_blobs),
         "idx_page_count": len(pages),
+        "idx_reparsed_page_count": len(reparsed_pages),
         "idx_serialized_size_bytes": len(idx_bytes),
+        "idx_template_family_count": template_library["family_count"],
+        "idx_chain_template_family_count": template_library["chain_family_count"],
+        "idx_compact_template_family_count": template_library["compact_family_count"],
+        "idx_compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
+        **manifest_note,
     }
     write_snapshot_artifacts(out_dir, manifest, canonical_entries, plan, target_library)
 
     dbdat_path = out_dir / "db.dat.prototype"
     records_path = out_dir / "db.dat.records.json"
+    blobs_path = out_dir / "db.dat.metadata_blobs.json"
     idx_path = out_dir / "db.idx.prototype"
     pages_path = out_dir / "db.idx.pages.json"
+    templates_path = out_dir / "db.idx.templates.json"
     dic_reference_path = out_dir / "db.dic.reference"
     dbdat_path.write_bytes(dbdat_bytes)
     records_path.write_text(json.dumps([asdict(record) for record in records], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    blobs_path.write_text(json.dumps([asdict(blob) for blob in metadata_blobs], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     idx_path.write_bytes(idx_bytes)
     pages_path.write_text(json.dumps(page_summaries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    templates_path.write_text(
+        json.dumps(
+            {
+                "page_count": template_library["page_count"],
+                "family_count": template_library["family_count"],
+                "families": template_library["family_summaries"],
+                "chain_family_count": template_library["chain_family_count"],
+                "compact_family_count": template_library["compact_family_count"],
+                "compact_families": template_library["compact_family_summaries"],
+                "compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
+                "compact_metadata_blobs": template_library["compact_metadata_blobs"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
     dic_reference_path.write_bytes(db_dic)
 
-    reparsed_records = validated_folder_file_records(dbdat_bytes)
-    reparsed_pages = parse_idx_prototype_pages(idx_bytes)
     report = {
         "out_dir": str(out_dir),
         "manifest_path": str(out_dir / "manifest.json"),
         "dbdat_path": str(dbdat_path),
         "records_path": str(records_path),
+        "blobs_path": str(blobs_path),
         "idx_path": str(idx_path),
         "pages_path": str(pages_path),
+        "templates_path": str(templates_path),
         "dic_reference_path": str(dic_reference_path),
         "record_count": len(records),
+        "metadata_blob_count": len(metadata_blobs),
         "reparsed_record_count": len(reparsed_records),
         "page_count": len(pages),
         "reparsed_page_count": len(reparsed_pages),
         "planned_addition_count": len(plan["planned_additions"]),
         "target_library_entry_count": len(target_library),
+        "template_family_count": template_library["family_count"],
+        "compact_template_family_count": template_library["compact_family_count"],
+        "compact_metadata_blob_count": template_library["compact_metadata_blob_count"],
     }
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
@@ -2532,15 +4546,44 @@ def command_test_install_prototype(args: argparse.Namespace) -> int:
     reparsed_pages = parse_idx_prototype_pages(idx_proto)
     if manifest.get("root") and str(root) != manifest["root"]:
         raise ValueError(f"Bundle root mismatch: manifest has {manifest['root']}, requested root is {root}")
-    if manifest.get("dbdat_record_count") is not None and len(reparsed_records) != manifest["dbdat_record_count"]:
+    expected_dbdat_reparsed = manifest.get("dbdat_reparsed_record_count", manifest.get("dbdat_record_count"))
+    if expected_dbdat_reparsed is not None and len(reparsed_records) != expected_dbdat_reparsed:
         raise ValueError("db.dat prototype record count does not match manifest")
-    if manifest.get("idx_page_count") is not None and len(reparsed_pages) != manifest["idx_page_count"]:
+    expected_idx_reparsed = manifest.get("idx_reparsed_page_count", manifest.get("idx_page_count"))
+    if expected_idx_reparsed is not None and len(reparsed_pages) != expected_idx_reparsed:
         raise ValueError("db.idx prototype page count does not match manifest")
     if dic_reference != current_dic and not args.replace_dic:
         raise ValueError("db.dic.reference does not match the current device db.dic; rerun with --replace-dic only if intentional")
 
-    padded_dbdat = pad_bytes_to_length(dbdat_proto, len(current_dbdat), "db.dat prototype")
-    padded_idx = pad_bytes_to_length(idx_proto, len(current_idx), "db.idx prototype")
+    safety_report = assess_install_safety(
+        current_dbdat,
+        current_idx,
+        current_dic,
+        dbdat_proto,
+        idx_proto,
+        manifest.get("target_library_entry_count"),
+    )
+    if safety_report["issues"] and not args.allow_unsafe_install:
+        issue_lines = "\n".join(f"- {issue}" for issue in safety_report["issues"])
+        raise ValueError(
+            "Refusing unsafe prototype install because the generated database looks much thinner than the current device database:\n"
+            f"{issue_lines}\n"
+            "Use --allow-unsafe-install only if you explicitly want to override this guard."
+        )
+
+    if len(dbdat_proto) > len(current_dbdat) and not args.allow_size_growth:
+        raise ValueError(
+            f"db.dat prototype is larger than the current device file ({len(dbdat_proto)} > {len(current_dbdat)}). "
+            "Rerun with --allow-size-growth only if you explicitly want to test larger database files."
+        )
+    if len(idx_proto) > len(current_idx) and not args.allow_size_growth:
+        raise ValueError(
+            f"db.idx prototype is larger than the current device file ({len(idx_proto)} > {len(current_idx)}). "
+            "Rerun with --allow-size-growth only if you explicitly want to test larger database files."
+        )
+
+    padded_dbdat = dbdat_proto if len(dbdat_proto) > len(current_dbdat) else pad_bytes_to_length(dbdat_proto, len(current_dbdat), "db.dat prototype")
+    padded_idx = idx_proto if len(idx_proto) > len(current_idx) else pad_bytes_to_length(idx_proto, len(current_idx), "db.idx prototype")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_dir = Path(args.backup_dir).resolve() if args.backup_dir else Path("/tmp") / f"iriver-e10-backup-{timestamp}"
@@ -2587,6 +4630,7 @@ def command_test_install_prototype(args: argparse.Namespace) -> int:
             "dbdat_record_count": manifest.get("dbdat_record_count"),
             "idx_page_count": manifest.get("idx_page_count"),
         },
+        "safety_report": safety_report,
     }
     (backup_dir / "install_manifest.json").write_text(json.dumps(install_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -2616,6 +4660,7 @@ def command_test_install_prototype(args: argparse.Namespace) -> int:
         "replaced_dic": bool(args.replace_dic),
         "record_count": len(reparsed_records),
         "page_count": len(reparsed_pages),
+        "safety_report": safety_report,
         "installed_sizes": {
             "db.dat": len(padded_dbdat),
             "db.idx": len(padded_idx),
@@ -2659,6 +4704,80 @@ def command_restore_system_backup(args: argparse.Namespace) -> int:
         "backup_dir": str(backup_dir),
         "restored": True,
     }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+def diff_byte_spans(left: bytes, right: bytes, *, max_spans: int = 32) -> list[dict[str, int]]:
+    limit = min(len(left), len(right))
+    spans: list[dict[str, int]] = []
+    start: int | None = None
+    prev = -1
+    for offset in range(limit):
+        if left[offset] == right[offset]:
+            if start is not None:
+                spans.append({"start": start, "end": prev + 1, "length": prev + 1 - start})
+                if len(spans) >= max_spans:
+                    return spans
+                start = None
+            continue
+        if start is None:
+            start = offset
+        prev = offset
+    if start is not None and len(spans) < max_spans:
+        spans.append({"start": start, "end": prev + 1, "length": prev + 1 - start})
+    if len(left) != len(right) and len(spans) < max_spans:
+        tail_start = limit
+        tail_end = max(len(left), len(right))
+        spans.append({"start": tail_start, "end": tail_end, "length": tail_end - tail_start})
+    return spans
+
+
+def summarize_binary_diff(left: bytes, right: bytes, *, page_size: int | None = None) -> dict[str, object]:
+    limit = min(len(left), len(right))
+    differing_offsets = [offset for offset in range(limit) if left[offset] != right[offset]]
+    report: dict[str, object] = {
+        "equal": left == right,
+        "left_size": len(left),
+        "right_size": len(right),
+        "differing_byte_count": len(differing_offsets) + abs(len(left) - len(right)),
+        "first_diff_offset": differing_offsets[0] if differing_offsets else (limit if len(left) != len(right) else None),
+        "diff_spans": diff_byte_spans(left, right),
+    }
+    if page_size:
+        page_limit = min(len(left), len(right)) // page_size
+        changed_pages = [
+            page_index
+            for page_index in range(page_limit)
+            if left[page_index * page_size:(page_index + 1) * page_size] != right[page_index * page_size:(page_index + 1) * page_size]
+        ]
+        report["changed_page_count"] = len(changed_pages)
+        report["changed_pages"] = changed_pages[:64]
+    return report
+
+
+def command_compare_bundle(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
+    bundle_dir = Path(args.bundle_dir).resolve()
+    files = find_db_files(root)
+
+    dbdat_proto_path = bundle_dir / "db.dat.prototype"
+    idx_proto_path = bundle_dir / "db.idx.prototype"
+    dic_reference_path = bundle_dir / "db.dic.reference"
+    missing = [str(path) for path in [dbdat_proto_path, idx_proto_path] if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing bundle files: {', '.join(missing)}")
+
+    report = {
+        "root": str(root),
+        "bundle_dir": str(bundle_dir),
+        "db.dat": summarize_binary_diff(files["db.dat"].read_bytes(), dbdat_proto_path.read_bytes()),
+        "db.idx": summarize_binary_diff(files["db.idx"].read_bytes(), idx_proto_path.read_bytes(), page_size=IDX_PAGE_SIZE),
+    }
+    if dic_reference_path.exists():
+        report["db.dic"] = summarize_binary_diff(files["db.dic"].read_bytes(), dic_reference_path.read_bytes())
+
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
@@ -2734,6 +4853,13 @@ def build_parser() -> argparse.ArgumentParser:
     idx_observed_page.add_argument("--max-groups", type=int, default=24, help="Maximum anchor groups to summarize per page")
     idx_observed_page.set_defaults(func=command_idx_observed_page)
 
+    idx_compact_page = subparsers.add_parser("idx-compact-page", help="Parse db.idx pages using the observed compact metadata/text-slot layout.")
+    idx_compact_page.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    idx_compact_page.add_argument("--page", type=int, help="Optional 0-based page index to inspect")
+    idx_compact_page.add_argument("--max-slots", type=int, default=24, help="Maximum compact text slots to parse per page")
+    idx_compact_page.add_argument("--max-tail-cells", type=int, default=24, help="Maximum 4-byte tail cells to summarize per slot")
+    idx_compact_page.set_defaults(func=command_idx_compact_page)
+
     idx_observed_summary = subparsers.add_parser("idx-observed-summary", help="Summarize observed chained-node patterns across the full db.idx.")
     idx_observed_summary.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
     idx_observed_summary.add_argument("--max-nodes", type=int, default=64, help="Maximum chained nodes to parse per page")
@@ -2741,6 +4867,12 @@ def build_parser() -> argparse.ArgumentParser:
     idx_observed_summary.add_argument("--limit", type=int, default=20, help="Maximum summary rows per section")
     idx_observed_summary.add_argument("--example-limit", type=int, default=5, help="Maximum example chains per anchor class")
     idx_observed_summary.set_defaults(func=command_idx_observed_summary)
+
+    idx_template_summary = subparsers.add_parser("idx-template-summary", help="Infer reusable idx templates from both chained-node and compact metadata pages.")
+    idx_template_summary.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
+    idx_template_summary.add_argument("--max-nodes", type=int, default=128, help="Maximum chained nodes to parse per page")
+    idx_template_summary.add_argument("--max-groups", type=int, default=32, help="Maximum anchor groups to summarize per page")
+    idx_template_summary.set_defaults(func=command_idx_template_summary)
 
     dat_tree = subparsers.add_parser("dat-tree", help="Render the parseable db.dat object records as a parent/child tree.")
     dat_tree.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
@@ -2810,11 +4942,18 @@ def build_parser() -> argparse.ArgumentParser:
     write_rebuild_prototype.add_argument("--max-collisions", type=int, default=8, help="Maximum existing matches per collision group")
     write_rebuild_prototype.set_defaults(func=command_write_rebuild_prototype)
 
+    compare_bundle = subparsers.add_parser("compare-bundle", help="Compare a generated prototype bundle to the current database files under one root.")
+    compare_bundle.add_argument("root", help="Mounted player root or local extracted root containing System/db.*")
+    compare_bundle.add_argument("bundle_dir", help="Prototype bundle directory produced by write-rebuild-prototype")
+    compare_bundle.set_defaults(func=command_compare_bundle)
+
     test_install_prototype = subparsers.add_parser("test-install-prototype", help="Install one rebuild prototype bundle onto the mounted player after backing up the current System/db.* files.")
     test_install_prototype.add_argument("root", help="Mounted player root, e.g. /run/media/nichlas/E10")
     test_install_prototype.add_argument("bundle_dir", help="Prototype bundle directory produced by write-rebuild-prototype")
     test_install_prototype.add_argument("--backup-dir", help="Optional directory for the automatic backup copy")
     test_install_prototype.add_argument("--replace-dic", action="store_true", help="Also replace db.dic with the bundle reference copy if needed")
+    test_install_prototype.add_argument("--allow-unsafe-install", action="store_true", help="Override the structural safety guard and install a prototype even if it looks much thinner than the current device database")
+    test_install_prototype.add_argument("--allow-size-growth", action="store_true", help="Allow installing db.dat/db.idx prototypes that are larger than the current device files")
     test_install_prototype.set_defaults(func=command_test_install_prototype)
 
     restore_system_backup = subparsers.add_parser("restore-system-backup", help="Restore System/db.* from a backup directory created by test-install-prototype.")

@@ -36,7 +36,9 @@ python3 e10db_tool.py media-xref /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py dat-tree /run/media/nichlas/E10
 python3 e10db_tool.py idx-page-map /run/media/nichlas/E10 --page 7
 python3 e10db_tool.py idx-observed-page /run/media/nichlas/E10 --page 7
+python3 e10db_tool.py idx-compact-page /run/media/nichlas/E10 --page 10
 python3 e10db_tool.py idx-observed-summary /run/media/nichlas/E10
+python3 e10db_tool.py idx-template-summary /run/media/nichlas/E10
 python3 e10db_tool.py media-cluster /run/media/nichlas/E10 "01 Hello.wma"
 python3 e10db_tool.py model-export /run/media/nichlas/E10
 python3 e10db_tool.py source-model /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
@@ -46,6 +48,7 @@ python3 e10db_tool.py write-rebuild-snapshot /run/media/nichlas/E10 /tmp/e10_sna
 python3 e10db_tool.py write-dbdat-prototype /run/media/nichlas/E10 /tmp/e10_dbdat_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py write-idx-prototype /run/media/nichlas/E10 /tmp/e10_idx_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
 python3 e10db_tool.py write-rebuild-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto /run/media/nichlas/E10/Music/Podcast --inventory /run/media/nichlas/E10/Music/Podcast/podcast_inventory.json
+python3 e10db_tool.py compare-bundle /run/media/nichlas/E10 /tmp/e10_rebuild_proto
 python3 e10db_tool.py test-install-prototype /run/media/nichlas/E10 /tmp/e10_rebuild_proto
 python3 e10db_tool.py restore-system-backup /run/media/nichlas/E10 /tmp/iriver-e10-backup-YYYYMMDD-HHMMSS
 ```
@@ -57,15 +60,22 @@ What the current tooling gives us:
 - `dat-tree` renders the parseable `db.dat` object records as a parent/child tree. By default it focuses on the validated folder/file kinds (`0x100`, `0x200`), which is useful for modeling folder/file identity and object IDs without the noisier unknown record shapes.
 - `idx-page-map` summarizes `db.idx` page by page with inline UTF-16BE strings, `db.dat` record pointers, and `db.dic` field-entry references.
 - `idx-observed-page` parses one real `db.idx` page using the current chained-node heuristic, exposing header words, absolute next pointers, payload text, and anchor-group patterns.
+- `idx-compact-page` parses the other major observed `db.idx` family: compact text-slot pages with inline UTF-16BE strings plus 32-bit references back into `db.dat` metadata blobs.
 - `idx-observed-summary` scans the full `db.idx` and summarizes the observed chain families by anchor class, node-type distribution, and payload class.
+- `idx-template-summary` now exports a mixed template view: reusable chained-node families plus the compact metadata-page family and the observed `db.dat` metadata-blob starts it refers to.
 - `media-cluster` groups the `db.idx` pages that mention one exact media string, so one track can be studied as a cross-page cluster instead of a single hit.
 - `model-export` builds a normalized per-file model from validated folder/file records, inferred ancestry, index coverage, and a simple canonicalization pass over duplicates.
 - `source-model` builds the same kind of normalized source view from one or more selected filesystem directories.
 - `rebuild-plan` compares selected source directories, or the full `Music/` tree, against the canonical E10 database model.
 - `write-rebuild-snapshot` writes a safe on-disk rebuild snapshot with canonical entries, planned additions, collisions, and a merged target library for later binary serialization.
 - `write-dbdat-prototype` takes the merged target library and emits a first `db.dat` prototype for the validated folder/file object graph.
-- `write-idx-prototype` takes the same target library plus the current `db.dic` schema and emits a first page-aligned observed-chain `db.idx` prototype.
-- `write-rebuild-prototype` packages the full current rebuild work product in one directory: snapshot JSON, `db.dat` prototype, `db.idx` prototype, and a `db.dic` reference copy.
+- `write-dbdat-prototype` now also emits `db.dat.metadata_blobs.json`, which lists any newly allocated BE metadata blobs for planned additions.
+- `write-idx-prototype` takes the same target library plus the current `db.dic` schema and emits a first page-aligned `db.idx` prototype together with `db.idx.templates.json`, which now records both chain families and the observed compact metadata family.
+- `write-idx-prototype` and `write-rebuild-prototype` now use a mixed additions model: chain pages for folder/file reachability, plus separate compact metadata pages that point at those new `db.dat` metadata blobs.
+- The compact additions serializer is now two-pass: it lays out each new compact page first, then patches observed same-page `idx_u32` refs so they point at the corresponding generated slot offsets instead of being zeroed.
+- Compact recipe selection now prefers a clean observed `audio + 4 metadata` block that repeats twice on the same source page; on the current backup that resolves to source page `4`, which matches the new additions page shape much better than the earlier page `150`/heuristic mix.
+- `write-rebuild-prototype` packages the full current rebuild work product in one directory: snapshot JSON, `db.dat` prototype, `db.idx` prototype, `db.dat.metadata_blobs.json`, and a `db.dic` reference copy.
+- `compare-bundle` measures byte-level distance between a generated bundle and one real database snapshot, which is now the main local verification loop for no-op match quality.
 - `missing-media` confirms that the 32 podcast episodes in this directory are on disk but absent from the E10 database.
 
 What `media-cluster` has shown so far:
@@ -73,6 +83,12 @@ What `media-cluster` has shown so far:
 - Some tracks expose aligned `db.dat` record pointers in `db.idx`, while others currently show up only as inline UTF-16BE strings on the index pages.
 - Duplicate file names can map to multiple parseable `db.dat` records. Example: `07_takida_-_reason_to_cry-tlb.mp3` currently resolves to three separate `db.dat` records with the same text but different offsets/object ancestry.
 - The practical consequence is that a future regenerator should rebuild E10's normalized media/index model from scratch, rather than trying to patch one isolated page or append one isolated object.
+
+What the compact metadata parser has shown so far:
+- The earlier “page 8” family is real and distinct from the chained-node pages. It is not a parser failure.
+- Those pages carry repeated inline UTF-16BE text slots such as file names and titles, plus 32-bit values like `0x00020960` that point back into `db.dat`.
+- A large subset of those `db.dat` offsets resolve to BE metadata blobs that start with four strings in artist/album/genre/title order.
+- Example: on page `10`, `0x00020960` resolves to `Oasis / (What's the Story) Morning Glory? / Rock / Hey Now!`, and `0x00020a08` resolves to the same album blob for `[Untitled Track]`.
 
 What `model-export` has shown so far:
 - The current snapshot contains 1087 parseable file-shaped `db.dat` entries, but many are shadows or duplicates.
@@ -101,6 +117,7 @@ What `write-idx-prototype` has shown so far:
 - The serializer no longer uses the earlier custom magic-header page format. It now emits observed chain-style pages with a 32-byte page summary, then 24-byte big-endian nodes linked by absolute next offsets, followed by inline UTF-16BE payloads.
 - For `Music/Podcast`, the current observed-chain prototype emits 206 pages, reparses cleanly back to 206 pages, and still covers all 586 target-library entries.
 - The page summaries now carry deterministic `target_path`, `object_id`, `db.dat` record-start links, and node counts for both existing tracks and planned additions.
+- The writer can now also derive reusable chain templates from the original `db.idx`, and it records those in `db.idx.templates.json` so regeneration is based on observed family shapes rather than only hard-coded node guesses.
 - This is still not the final firmware-compatible layout, but it is materially closer to the original E10 pages than the earlier fixed-header prototype.
 
 What `write-rebuild-prototype` gives us:
